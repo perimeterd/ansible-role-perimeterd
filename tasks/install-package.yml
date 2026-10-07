@@ -1,0 +1,87 @@
+---
+# DNF/Zypper may keep a newer installed RPM without failing. Let RPM itself reject
+# an older local artifact before those managers run; no version parsing is needed.
+- name: Refuse RPM downgrades unless perimeterd_allow_downgrade is true
+  ansible.builtin.command:
+    argv:
+      - rpm
+      - --upgrade
+      - --test
+      - --replacepkgs
+      - --nodeps
+      - --nosignature
+      - "{{ _perimeterd_package_path }}"
+  changed_when: false
+  when:
+    - _perimeterd_package_format == 'rpm'
+    - not perimeterd_allow_downgrade
+
+- name: Ensure the Ansible local-DEB extraction prerequisite
+  ansible.builtin.apt:
+    name: xz-utils
+    state: present
+    cache_valid_time: 3600
+    install_recommends: false
+  when: ansible_facts['pkg_mgr'] == 'apt'
+
+- name: Install the verified DEB while preserving the existing configuration
+  ansible.builtin.apt:
+    deb: "{{ _perimeterd_package_path }}"
+    state: present
+    dpkg_options: force-confdef,force-confold
+    allow_downgrade: "{{ perimeterd_allow_downgrade }}"
+    install_recommends: false
+  register: _perimeterd_apt_install
+  when: ansible_facts['pkg_mgr'] == 'apt'
+
+# The DNF modules couple localpkg_gpgcheck to repository signature checks. Use
+# native DNF to allow this verified local RPM without weakening repository policy.
+- name: Read the installed RPM identity before DNF
+  ansible.builtin.command:
+    argv: [rpm, --query, --queryformat, '%{NAME}-%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}', perimeterd]
+  register: _perimeterd_dnf_before
+  changed_when: false
+  failed_when: _perimeterd_dnf_before.rc not in [0, 1]
+  when: ansible_facts['pkg_mgr'] in ['dnf', 'dnf5']
+
+- name: Install the verified RPM and let DNF resolve its dependencies
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_facts['pkg_mgr'] }}"
+      - --assumeyes
+      - --setopt=localpkg_gpgcheck=0
+      - --setopt=install_weak_deps=False
+      - install
+      - "{{ _perimeterd_package_path }}"
+  changed_when: false
+  when: ansible_facts['pkg_mgr'] in ['dnf', 'dnf5']
+
+- name: Read the installed RPM identity after DNF
+  ansible.builtin.command:
+    argv: [rpm, --query, --queryformat, '%{NAME}-%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}', perimeterd]
+  register: _perimeterd_dnf_after
+  changed_when: false
+  when: ansible_facts['pkg_mgr'] in ['dnf', 'dnf5']
+
+- name: Report whether DNF changed the perimeterd package
+  ansible.builtin.set_fact:
+    _perimeterd_dnf_changed: "{{ _perimeterd_dnf_before.rc != 0 or _perimeterd_dnf_before.stdout != _perimeterd_dnf_after.stdout }}"
+  changed_when: _perimeterd_dnf_changed
+  when: ansible_facts['pkg_mgr'] in ['dnf', 'dnf5']
+
+- name: Install the verified local RPM with Zypper
+  community.general.zypper:
+    name: "{{ _perimeterd_package_path }}"
+    state: present
+    disable_gpg_check: false
+    extra_args: --allow-unsigned-rpm
+    disable_recommends: true
+    oldpackage: "{{ perimeterd_allow_downgrade }}"
+  register: _perimeterd_zypper_install
+  when: ansible_facts['pkg_mgr'] == 'zypper'
+
+- name: Record whether the perimeterd package transaction changed the host
+  ansible.builtin.set_fact:
+    _perimeterd_package_changed: >-
+      {{ _perimeterd_dnf_changed if ansible_facts['pkg_mgr'] in ['dnf', 'dnf5']
+         else (_perimeterd_apt_install is changed or _perimeterd_zypper_install is changed) }}

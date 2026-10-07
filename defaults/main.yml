@@ -1,0 +1,13 @@
+---
+perimeterd_version: latest
+perimeterd_allow_downgrade: false
+perimeterd_config:
+  version: 1
+  firewall:
+    backend: nftables
+  policies: []
+perimeterd_service_enabled: true
+perimeterd_service_state: started
+perimeterd_config_show_diff: false
+perimeterd_github_token: ''
+perimeterd_download_timeout: 60

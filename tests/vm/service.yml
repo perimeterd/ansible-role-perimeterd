@@ -1,0 +1,29 @@
+---
+- name: Exercise service reconciliation against the real installed daemon
+  hosts: perimeterd
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Read the configuration bytes whose acknowledgement is expected
+      ansible.builtin.slurp:
+        src: /etc/perimeterd/perimeterd.yaml
+      register: _service_config
+      no_log: true
+
+    - name: Set service reconciliation inputs
+      ansible.builtin.set_fact:
+        _perimeterd_config_sha256: "{{ _service_config.content | b64decode | hash('sha256') }}"
+        _perimeterd_package_identity: "{{ smoke_package_identity }}"
+        _perimeterd_package_changed: "{{ smoke_package_changed | default(false) }}"
+        perimeterd_service_state: "{{ smoke_service_state | default('started') }}"
+        perimeterd_service_enabled: true
+
+    - name: Replace bytes after rendering to exercise digest mismatch
+      ansible.builtin.copy:
+        dest: /etc/perimeterd/perimeterd.yaml
+        content: "{{ smoke_replacement_config | to_nice_yaml(indent=2, sort_keys=true) }}"
+        mode: '0600'
+      when: smoke_replacement_config is defined
+
+    - name: Reconcile the service with the captured rendered digest
+      ansible.builtin.include_tasks: ../../tasks/service.yml

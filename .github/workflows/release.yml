@@ -1,0 +1,111 @@
+name: Release standalone Galaxy role
+
+on:
+  push:
+    tags: ['[0-9]*.[0-9]*.[0-9]*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  admission:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      commit: ${{ steps.tag.outputs.commit }}
+    steps:
+      - name: Check out role tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify signed stable tag and main ancestry
+        id: tag
+        env:
+          RELEASE_SIGNING_PUBLIC_KEYS: ${{ secrets.RELEASE_SIGNING_PUBLIC_KEYS }}
+        run: |
+          git fetch --quiet origin main
+          python3 scripts/release.py admit
+
+  checks:
+    needs: admission
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    needs: [admission, checks]
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Check out tested role commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.admission.outputs.commit }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Reverify identity and create or reuse the stable GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SIGNING_PUBLIC_KEYS: ${{ secrets.RELEASE_SIGNING_PUBLIC_KEYS }}
+          ROLE_TAG: ${{ needs.admission.outputs.tag }}
+          COMMIT: ${{ needs.admission.outputs.commit }}
+        run: |
+          git fetch --quiet origin main
+          python3 scripts/release.py publish
+
+  import:
+    needs: [admission, publish]
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    environment: galaxy
+    concurrency:
+      group: galaxy-role-import
+      cancel-in-progress: false
+    steps:
+      - name: Check out tested role commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.admission.outputs.commit }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Reverify signed role tag before Galaxy import
+        env:
+          RELEASE_SIGNING_PUBLIC_KEYS: ${{ secrets.RELEASE_SIGNING_PUBLIC_KEYS }}
+        run: |
+          git fetch --quiet origin main
+          python3 scripts/release.py admit
+      - name: Set up supported Ansible controller
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.14'
+      - name: Install latest 2.21 Galaxy CLI
+        run: python -m pip install 'ansible-core==2.21.*'
+      - name: Import and wait for Galaxy result
+        env:
+          ANSIBLE_GALAXY_SERVER_LIST: publish
+          ANSIBLE_GALAXY_SERVER_PUBLISH_URL: https://galaxy.ansible.com/api/
+          ANSIBLE_GALAXY_SERVER_PUBLISH_TOKEN: ${{ secrets.GALAXY_API_TOKEN }}
+          ROLE_TAG: ${{ needs.admission.outputs.tag }}
+        run: |
+          set -euo pipefail
+          test -n "$ANSIBLE_GALAXY_SERVER_PUBLISH_TOKEN" || {
+            echo 'Configure GALAXY_API_TOKEN in the protected galaxy environment' >&2; exit 1;
+          }
+          if ! result=$(ansible-galaxy role import perimeterd ansible-role-perimeterd \
+              --role-name perimeterd --branch "$ROLE_TAG" --timeout 600); then
+            printf '%s\n' "$result" >&2
+            exit 1
+          fi
+          printf '%s\n' "$result"
+          case "$result" in
+            *'More than one Galaxy role associated'*)
+              echo 'Ambiguous Galaxy role mapping; import not accepted' >&2
+              exit 1
+              ;;
+          esac

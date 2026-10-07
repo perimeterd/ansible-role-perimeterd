@@ -1,0 +1,107 @@
+---
+# Configuration validation has already succeeded before main.yml imports this file.
+- name: Enforce boot enablement and read systemd's current service status
+  ansible.builtin.systemd_service:
+    name: perimeterd.service
+    enabled: "{{ perimeterd_service_enabled }}"
+  register: _perimeterd_service
+
+- name: Keep a deliberately stopped service stopped
+  ansible.builtin.systemd_service:
+    name: perimeterd.service
+    state: stopped
+  when: perimeterd_service_state == 'stopped'
+
+- name: Reconcile a service that should be running
+  when: perimeterd_service_state == 'started'
+  vars:
+    _perimeterd_service_active: "{{ _perimeterd_service.status.ActiveState == 'active' }}"
+    _perimeterd_expected_marker: |
+      config_sha256={{ _perimeterd_config_sha256 }}
+      package={{ _perimeterd_package_identity }}
+  block:
+    # Compare actual executables to recover an upgrade interrupted after package
+    # installation, when this run's package task correctly reports no change.
+    - name: Inspect the installed executable
+      ansible.builtin.stat:
+        path: /usr/bin/perimeterd
+        follow: true
+        get_checksum: false
+      register: _perimeterd_installed_executable
+      when: _perimeterd_service_active
+
+    - name: Inspect the running executable
+      ansible.builtin.stat:
+        path: "/proc/{{ _perimeterd_service.status.MainPID }}/exe"
+        follow: true
+        get_checksum: false
+      register: _perimeterd_running_executable
+      when: _perimeterd_service_active
+
+    - name: Check whether a successful-application marker exists
+      ansible.builtin.stat:
+        path: /var/lib/perimeterd-ansible/config-applied
+        get_checksum: false
+      register: _perimeterd_marker
+
+    - name: Read the last successful-application marker
+      ansible.builtin.slurp:
+        src: /var/lib/perimeterd-ansible/config-applied
+      register: _perimeterd_applied_marker
+      no_log: true
+      when: _perimeterd_marker.stat.exists
+
+    - name: Select the service action once
+      ansible.builtin.set_fact:
+        _perimeterd_service_action: >-
+          {{ 'started' if not _perimeterd_service_active
+             else 'restarted' if (_perimeterd_package_changed
+               or (_perimeterd_running_executable.stat.dev | default(-1)) != _perimeterd_installed_executable.stat.dev
+               or (_perimeterd_running_executable.stat.inode | default(-1)) != _perimeterd_installed_executable.stat.inode)
+             else 'reload' if (_perimeterd_applied_marker.content | default('') | b64decode) != _perimeterd_expected_marker
+             else 'started' }}
+
+    - name: Start or restart perimeterd as needed
+      ansible.builtin.systemd_service:
+        name: perimeterd.service
+        state: "{{ _perimeterd_service_action }}"
+      when: _perimeterd_service_action != 'reload'
+
+    - name: Predict an acknowledged reload in check mode
+      ansible.builtin.debug:
+        msg: The rendered configuration would require an acknowledged reload.
+      changed_when: true
+      when:
+        - ansible_check_mode
+        - _perimeterd_service_action == 'reload'
+
+    - name: Reload the exact rendered configuration and await application
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/perimeterd
+          - reload
+          - --expect-config-sha256
+          - "{{ _perimeterd_config_sha256 }}"
+      changed_when: true
+      when:
+        - not ansible_check_mode
+        - _perimeterd_service_action == 'reload'
+
+    # A failed service action stops the block before this checkpoint is written.
+    - name: Ensure the private application-state directory exists
+      ansible.builtin.file:
+        path: /var/lib/perimeterd-ansible
+        state: directory
+        owner: root
+        group: root
+        mode: '0700'
+      when: not ansible_check_mode
+
+    - name: Record successful service handling
+      ansible.builtin.copy:
+        dest: /var/lib/perimeterd-ansible/config-applied
+        content: "{{ _perimeterd_expected_marker }}"
+        owner: root
+        group: root
+        mode: '0600'
+      when: not ansible_check_mode

@@ -1,0 +1,5 @@
+---
+# For isolated ansible-core 2.16 environments only; modern controllers use requirements-collections.yml.
+collections:
+  - name: community.general
+    version: '>=11.4.9,<12.0.0'

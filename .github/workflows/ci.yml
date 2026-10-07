@@ -1,0 +1,106 @@
+name: Role CI
+
+on:
+  workflow_call:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: role-ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  core:
+    name: ansible-core ${{ matrix.ansible_core }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - ansible_core: '2.16'
+            python: '3.12'
+            collection_requirements: requirements-collections-legacy.yml
+          - ansible_core: '2.21'
+            python: '3.14'
+            collection_requirements: requirements-collections.yml
+    steps:
+      - name: Check out role
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Python ${{ matrix.python }}
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install latest patch of selected controller line and Zypper dependency
+        run: |
+          python -m pip install "ansible-core==${{ matrix.ansible_core }}.*"
+          ansible-galaxy collection install -r "${{ matrix.collection_requirements }}"
+      - name: Run deterministic release fixtures
+        run: python -m unittest discover -s tests -p 'test_*.py'
+      - name: Check actual smoke play syntax
+        run: |
+          mkdir -p "${RUNNER_TEMP}/roles"
+          ln -s "${GITHUB_WORKSPACE}" "${RUNNER_TEMP}/roles/perimeterd"
+          echo "ANSIBLE_ROLES_PATH=${RUNNER_TEMP}/roles" >> "${GITHUB_ENV}"
+          ANSIBLE_ROLES_PATH="${RUNNER_TEMP}/roles" ansible-playbook -i 'perimeterd,' -c local tests/vm/smoke.yml --syntax-check
+      - name: Lint role tasks and workflow-facing playbooks
+        if: matrix.ansible_core == '2.21'
+        run: |
+          python -m pip install ansible-lint==26.9.0
+          ansible-lint --strict .
+
+  vm:
+    name: native systemd VM (${{ matrix.platform }}, core ${{ matrix.ansible_core }})
+    if: github.event_name == 'push'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: debian-amd64
+            ansible_core: '2.20'
+            python: '3.13'
+            collection_requirements: requirements-collections.yml
+          - platform: fedora-arm64
+            ansible_core: '2.21'
+            python: '3.14'
+            collection_requirements: requirements-collections.yml
+          - platform: rocky-amd64
+            ansible_core: '2.16'
+            python: '3.12'
+            collection_requirements: requirements-collections-legacy.yml
+    steps:
+      - name: Check out role
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Ansible controller
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install QEMU and cloud-init seed tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes qemu-system-x86 qemu-system-arm qemu-efi-aarch64 qemu-utils genisoimage openssh-client
+      - name: Install the matching controller and collection requirements
+        run: |
+          python -m pip install "ansible-core==${{ matrix.ansible_core }}.*"
+          ansible-galaxy collection install -r "${{ matrix.collection_requirements }}"
+      - name: Exercise real package and service in isolated VM
+        env:
+          PERIMETERD_TEST_GITHUB_TOKEN: ${{ github.token }}
+        run: python tests/vm/run.py --platform '${{ matrix.platform }}' --workdir '${{ runner.temp }}/perimeterd-role-vm'
+      - name: Upload VM diagnostics
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: role-vm-${{ matrix.platform }}
+          path: ${{ runner.temp }}/perimeterd-role-vm/logs/
+          if-no-files-found: warn

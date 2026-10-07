@@ -1,0 +1,6 @@
+version: 1
+policies: []
+firewall:
+  ipv6: true
+  backend: nftables
+  ipv4: true

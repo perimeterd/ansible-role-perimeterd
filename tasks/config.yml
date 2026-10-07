@@ -1,0 +1,76 @@
+---
+- name: Reset configuration result facts and derive deterministic content identity
+  ansible.builtin.set_fact:
+    _perimeterd_config_validated: false
+    _perimeterd_config_template_changed: false
+    _perimeterd_config_sha256: "{{ lookup('ansible.builtin.template', 'perimeterd.yaml.j2') | hash('sha256') }}"
+  no_log: true
+
+- name: Ensure the perimeterd configuration directory is private
+  ansible.builtin.file:
+    path: /etc/perimeterd
+    state: directory
+    owner: root
+    group: root
+    mode: '0700'
+
+- name: Render only a validated perimeterd configuration
+  block:
+    - name: Atomically render perimeterd configuration with the installed validator
+      ansible.builtin.template:
+        src: perimeterd.yaml.j2
+        dest: /etc/perimeterd/perimeterd.yaml
+        owner: root
+        group: root
+        mode: '0600'
+        validate: /usr/bin/perimeterd validate --config %s
+      register: _perimeterd_config_template_result
+      no_log: true
+      diff: false
+
+  rescue:
+    - name: Report sanitized configuration validation or installation failure
+      ansible.builtin.fail:
+        msg: >-
+          perimeterd configuration validation or atomic installation failed;
+          candidate values and validator output were suppressed. Check the
+          configuration against the installed perimeterd schema and verify
+          target filesystem permissions.
+
+- name: Record configuration validation and content-change results
+  ansible.builtin.set_fact:
+    _perimeterd_config_validated: true
+    _perimeterd_config_template_changed: "{{ _perimeterd_config_template_result.changed | default(false) }}"
+  changed_when: false
+
+- name: Validate unchanged perimeterd configuration with the selected installed executable
+  when: not (_perimeterd_config_template_changed | bool)
+  block:
+    - name: Run offline validation when rendering produced no new candidate
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/perimeterd
+          - validate
+          - --config
+          - /etc/perimeterd/perimeterd.yaml
+      changed_when: false
+      no_log: true
+
+  rescue:
+    - name: Report sanitized validation failure for unchanged configuration
+      ansible.builtin.fail:
+        msg: >-
+          perimeterd configuration validation failed; configuration values and
+          validator output were suppressed. Check the configuration against the
+          installed perimeterd schema.
+
+- name: Show an opt-in redacted diff after successful configuration validation
+  ansible.builtin.debug:
+    msg:
+      - 'before: <redacted>'
+      - 'after:'
+      - "{{ perimeterd_config | to_nice_yaml(indent=2, sort_keys=true, width=4096) | trim }}"
+  when:
+    - perimeterd_config_show_diff | bool
+    - _perimeterd_config_validated | bool
+    - _perimeterd_config_template_changed | bool

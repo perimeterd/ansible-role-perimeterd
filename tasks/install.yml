@@ -1,0 +1,65 @@
+---
+- name: Read the selected release checksum manifest
+  ansible.builtin.uri:
+    url: "{{ _perimeterd_checksums_asset.browser_download_url }}"
+    return_content: true
+    timeout: "{{ perimeterd_download_timeout | int }}"
+  register: _perimeterd_checksums
+  changed_when: false
+  check_mode: false
+
+- name: Parse SHA-256 records and the selected artifact checksum
+  ansible.builtin.set_fact:
+    _perimeterd_checksum_records: >-
+      {{ _perimeterd_checksums.content
+         | regex_findall('(?m)^([0-9A-Fa-f]{64})(?:  | [*])([A-Za-z0-9][A-Za-z0-9._+~-]*)\r?$') }}
+    _perimeterd_selected_checksums: >-
+      {{ _perimeterd_checksums.content
+         | regex_findall('(?m)^([0-9A-Fa-f]{64})(?:  | [*])'
+                         ~ (_perimeterd_asset.name | regex_escape) ~ '\r?$') }}
+
+- name: Require a valid manifest and exactly one checksum for the selected package
+  ansible.builtin.assert:
+    that:
+      - _perimeterd_checksum_records | length > 0
+      - _perimeterd_checksum_records | length == _perimeterd_checksums.content.splitlines() | length
+      - _perimeterd_selected_checksums | length == 1
+    fail_msg: The selected release checksums.txt must contain valid SHA-256 basename records and exactly one record for the package asset.
+
+- name: Define the verified artifact identity and cache path
+  ansible.builtin.set_fact:
+    _perimeterd_package_identity: "{{ _perimeterd_asset.name }}"
+    _perimeterd_package_path: "/var/cache/perimeterd/{{ _perimeterd_selected_checksums[0] | lower }}-{{ _perimeterd_asset.name }}"
+
+- name: Explain the read-only check-mode boundary
+  ansible.builtin.debug:
+    msg: >-
+      Selected {{ _perimeterd_selected_tag }} ({{ _perimeterd_asset.name }}) and verified its checksum manifest.
+      Check mode does not download or install packages. Native downgrade checks,
+      configuration validation and service actions are deferred to a normal run;
+      no installation or lifecycle changes are predicted.
+  when: ansible_check_mode
+
+- name: Install the checksum-verified package
+  when: not ansible_check_mode
+  block:
+    - name: Create the private package cache
+      ansible.builtin.file:
+        path: /var/cache/perimeterd
+        state: directory
+        owner: root
+        group: root
+        mode: '0700'
+
+    - name: Download the selected native package with SHA-256 verification
+      ansible.builtin.get_url:
+        url: "{{ _perimeterd_asset.browser_download_url }}"
+        dest: "{{ _perimeterd_package_path }}"
+        checksum: "sha256:{{ _perimeterd_selected_checksums[0] | lower }}"
+        owner: root
+        group: root
+        mode: '0600'
+        timeout: "{{ perimeterd_download_timeout | int }}"
+
+    - name: Run the native package manager
+      ansible.builtin.include_tasks: install-package.yml

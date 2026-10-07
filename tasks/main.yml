@@ -1,0 +1,70 @@
+---
+- name: Gather platform facts required by perimeterd
+  ansible.builtin.setup:
+    gather_subset:
+      - '!all'
+      - min
+  changed_when: false
+
+- name: Validate release selector and public controls
+  ansible.builtin.assert:
+    that:
+      - perimeterd_version is string
+      - >-
+        perimeterd_version == 'latest'
+        or perimeterd_version == 'latest-prerelease'
+        or perimeterd_version is match(
+          '^v?(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)'
+          ~ '(?:-(?:(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)'
+          ~ '(?:\\.(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*))?'
+          ~ '(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$'
+        )
+      - perimeterd_allow_downgrade is boolean
+      - perimeterd_service_enabled is boolean
+      - perimeterd_service_state in ['started', 'stopped']
+      - perimeterd_config_show_diff is boolean
+      - perimeterd_github_token is string
+      - perimeterd_download_timeout is number
+      - perimeterd_download_timeout | int > 0
+    fail_msg: Invalid perimeterd selector or public setting; use a SemVer tag, latest or latest-prerelease.
+
+- name: Validate complete daemon configuration shape without printing secrets
+  ansible.builtin.assert:
+    that:
+      - perimeterd_config is mapping
+      - perimeterd_config | length > 0
+      - perimeterd_config.firewall is defined
+      - perimeterd_config.firewall is mapping
+      - perimeterd_config.firewall.backend is not defined or perimeterd_config.firewall.backend in ['nftables', 'iptables']
+    fail_msg: perimeterd_config must be a nonempty full mapping with a firewall mapping and supported backend.
+  no_log: true
+
+- name: Validate native package and service capabilities
+  ansible.builtin.assert:
+    that:
+      - ansible_facts['system'] == 'Linux'
+      - ansible_facts['architecture'] in ['x86_64', 'amd64', 'aarch64', 'arm64']
+      - ansible_facts['pkg_mgr'] in ['apt', 'dnf', 'dnf5', 'zypper']
+      - ansible_facts['service_mgr'] == 'systemd'
+    fail_msg: >-
+      perimeterd requires Linux amd64/arm64, an APT/DNF4/DNF5/Zypper native
+      package manager and a working systemd service manager.
+
+- name: Derive release package family and architecture for this invocation
+  ansible.builtin.set_fact:
+    _perimeterd_package_format: "{{ 'deb' if ansible_facts['pkg_mgr'] == 'apt' else 'rpm' }}"
+    _perimeterd_architecture: "{{ 'amd64' if ansible_facts['architecture'] in ['x86_64', 'amd64'] else 'arm64' }}"
+
+- name: Resolve the official perimeterd release and package
+  ansible.builtin.import_tasks: resolve.yml
+
+- name: Inspect and install the selected native package
+  ansible.builtin.import_tasks: install.yml
+
+- name: Validate and install complete perimeterd configuration
+  ansible.builtin.import_tasks: config.yml
+  when: not ansible_check_mode
+
+- name: Apply the desired perimeterd service state
+  ansible.builtin.import_tasks: service.yml
+  when: not ansible_check_mode

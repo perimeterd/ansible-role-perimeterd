@@ -1,0 +1,96 @@
+---
+- name: Converge perimeterd on disposable systemd VM
+  hosts: perimeterd
+  gather_facts: false
+  become: true
+  environment: "{{ smoke_transport_environment | default({}) }}"
+  vars:
+    smoke_version: latest-prerelease
+    smoke_service_state: started
+    smoke_service_enabled: true
+    smoke_config:
+      version: 1
+      firewall:
+        backend: nftables
+      policies: []
+  tasks:
+    - name: Apply the standalone perimeterd role
+      ansible.builtin.include_role:
+        name: perimeterd
+      vars:
+        perimeterd_version: "{{ smoke_version }}"
+        perimeterd_config: "{{ smoke_config }}"
+        perimeterd_service_state: "{{ smoke_service_state }}"
+        perimeterd_service_enabled: "{{ smoke_service_enabled }}"
+        perimeterd_github_token: "{{ lookup('ansible.builtin.env', 'PERIMETERD_TEST_GITHUB_TOKEN') }}"
+
+    - name: Report the concrete release selected for VM lifecycle assertions
+      ansible.builtin.debug:
+        msg: "RESOLVED_TAG={{ _perimeterd_selected_tag }}"
+
+    - name: Inspect installed daemon configuration
+      ansible.builtin.stat:
+        path: /etc/perimeterd/perimeterd.yaml
+      register: _smoke_config_file
+
+    - name: Read rendered daemon configuration without disclosing it
+      ansible.builtin.slurp:
+        src: /etc/perimeterd/perimeterd.yaml
+      register: _smoke_config_bytes
+      no_log: true
+
+    - name: Inspect installed DEB version
+      ansible.builtin.command:
+        argv: [dpkg-query, -W, '-f=${Version}', perimeterd]
+      register: _smoke_native_deb
+      changed_when: false
+      when: _perimeterd_package_format == 'deb'
+
+    - name: Inspect installed RPM version
+      ansible.builtin.command:
+        argv: [rpm, -q, '--qf', '%{EPOCHNUM}:%{VERSION}-%{RELEASE}', perimeterd]
+      register: _smoke_native_rpm
+      changed_when: false
+      when: _perimeterd_package_format == 'rpm'
+
+    - name: Inspect packaged service state
+      ansible.builtin.command:
+        argv: [systemctl, show, perimeterd.service, '--property=ActiveState', '--property=UnitFileState', '--property=MainPID']
+      register: _smoke_service
+      changed_when: false
+
+    - name: Validate actual installed package, config and service
+      ansible.builtin.assert:
+        that:
+          - _smoke_config_file.stat.exists
+          - _smoke_config_file.stat.mode == '0600'
+          - _smoke_config_file.stat.pw_name == 'root'
+          - _smoke_config_file.stat.gr_name == 'root'
+          - (_smoke_config_bytes.content | b64decode | from_yaml) == smoke_config
+          - >-
+            (_smoke_native_deb.stdout if _perimeterd_package_format == 'deb' else _smoke_native_rpm.stdout)
+            == (('' if _perimeterd_package_format == 'deb' else '0:')
+                ~ (_perimeterd_selected_tag | regex_replace('^v', '') | regex_replace('^([0-9]+[.][0-9]+[.][0-9]+)-', '\\1~'))
+                ~ '-1')
+          - "('ActiveState=active' in _smoke_service.stdout) == (smoke_service_state == 'started')"
+          - "('UnitFileState=enabled' in _smoke_service.stdout) == (smoke_service_enabled | bool)"
+        fail_msg: Native package, rendered config or systemd state differs from selected release.
+      no_log: true
+
+    - name: Read the acknowledged configuration checkpoint
+      ansible.builtin.slurp:
+        src: /var/lib/perimeterd-ansible/config-applied
+      register: _smoke_applied
+      no_log: true
+      when: smoke_service_state == 'started'
+
+    - name: Require exact rendered digest and selected package in checkpoint
+      vars:
+        _smoke_expected_marker: |
+          config_sha256={{ _smoke_config_bytes.content | b64decode | hash('sha256') }}
+          package={{ _perimeterd_package_identity }}
+      ansible.builtin.assert:
+        that:
+          - (_smoke_applied.content | b64decode) == _smoke_expected_marker
+      no_log: true
+      when: smoke_service_state == 'started'

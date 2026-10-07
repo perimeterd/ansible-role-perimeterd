@@ -1,0 +1,326 @@
+---
+- name: Capture this host's resolver controls for delegated requests
+  ansible.builtin.set_fact:
+    _perimeterd_resolution_selector: "{{ perimeterd_version }}"
+    _perimeterd_resolution_timeout: "{{ perimeterd_download_timeout | int }}"
+    _perimeterd_resolution_api_token: "{{ perimeterd_github_token }}"
+  no_log: true
+
+- name: Select the release lookup URL without changing exact tag spelling
+  ansible.builtin.set_fact:
+    _perimeterd_release_lookup_url: >-
+      {{
+        'https://api.github.com/repos/perimeterd/perimeterd/releases/latest'
+        if _perimeterd_resolution_selector == 'latest'
+        else 'https://api.github.com/repos/perimeterd/perimeterd/releases?per_page=100'
+        if _perimeterd_resolution_selector == 'latest-prerelease'
+        else 'https://api.github.com/repos/perimeterd/perimeterd/releases/tags/'
+             ~ (_perimeterd_resolution_selector | urlencode)
+      }}
+
+- name: Request release metadata once for this host
+  block:
+    - name: Read selected release metadata from the GitHub API
+      ansible.builtin.uri:
+        url: "{{ hostvars[inventory_hostname]['_perimeterd_release_lookup_url'] }}"
+        method: GET
+        headers: >-
+          {{
+            {
+              'Accept': 'application/vnd.github+json',
+              'X-GitHub-Api-Version': '2026-03-10',
+              'User-Agent': 'perimeterd-ansible-role'
+            }
+            | combine(
+                {'Authorization': 'Bearer ' ~ hostvars[inventory_hostname]['_perimeterd_resolution_api_token']}
+                if hostvars[inventory_hostname]['_perimeterd_resolution_api_token'] | length > 0
+                else {}
+              )
+          }}
+        status_code: "{{ range(100, 600) | list }}"
+        return_content: true
+        follow_redirects: none
+        validate_certs: true
+        timeout: "{{ hostvars[inventory_hostname]['_perimeterd_resolution_timeout'] }}"
+      delegate_to: localhost
+      become: false
+      register: _perimeterd_api_response
+      changed_when: false
+      check_mode: false
+      no_log: true
+  rescue:
+    - name: Report a sanitized selected-release API request failure
+      ansible.builtin.fail:
+        msg: >-
+          The GitHub release API request failed because of a controller network,
+          TLS, or HTTP transport error.
+
+- name: Validate selected-release API response status
+  ansible.builtin.assert:
+    that:
+      - _perimeterd_api_response.status | int == 200
+    fail_msg: >-
+      {{
+        'GitHub API authentication failed (HTTP 401); check the optional read token.'
+        if _perimeterd_api_response.status | int == 401
+        else
+        'GitHub API access was rate-limited (HTTP '
+        ~ (_perimeterd_api_response.status | string) ~ '). Retry after the limit resets.'
+        if _perimeterd_api_response.status | int == 429
+        or (
+          _perimeterd_api_response.status | int == 403
+          and (
+            _perimeterd_api_response.get(
+              'x_ratelimit_remaining',
+              (_perimeterd_api_response.get('headers') or {}).get('x-ratelimit-remaining', '')
+            ) | string == '0'
+            or _perimeterd_api_response.get(
+              'retry_after',
+              (_perimeterd_api_response.get('headers') or {}).get('retry-after', '')
+            ) | string | length > 0
+            or 'rate limit' in (_perimeterd_api_response.content | default('') | lower)
+          )
+        )
+        else
+        'GitHub API access was forbidden (HTTP 403); check the optional read token.'
+        if _perimeterd_api_response.status | int == 403
+        else
+        'No published stable perimeterd release is available; choose latest-prerelease or an exact tag.'
+        if _perimeterd_api_response.status | int == 404
+        and _perimeterd_resolution_selector == 'latest'
+        else
+        'The exact perimeterd tag was not found; exact pins never fall back to another release.'
+        if _perimeterd_api_response.status | int == 404
+        else
+        'GitHub release API returned unexpected HTTP status '
+        ~ (_perimeterd_api_response.status | string) ~ '.'
+      }}
+
+
+- name: Parse release JSON without exposing response content
+  block:
+    - name: Decode selected release JSON
+      ansible.builtin.set_fact:
+        _perimeterd_api_response_json: "{{ _perimeterd_api_response.content | from_json }}"
+      no_log: true
+  rescue:
+    - name: Report malformed selected-release JSON
+      ansible.builtin.fail:
+        msg: GitHub release API returned malformed JSON.
+
+- name: Select a published prerelease from the first 100 releases only
+  when: _perimeterd_resolution_selector == 'latest-prerelease'
+  block:
+    - name: Require a release-list array
+      ansible.builtin.assert:
+        that:
+          - _perimeterd_api_response_json is sequence
+          - _perimeterd_api_response_json is not string
+          - _perimeterd_api_response_json is not mapping
+        fail_msg: GitHub release-list API returned a malformed releases array.
+
+    - name: Validate release-list entries before filtering by channel
+      ansible.builtin.assert:
+        that:
+          - item is mapping
+          - item.get('draft') is boolean
+          - item.get('prerelease') is boolean
+        fail_msg: GitHub release-list API returned a malformed release entry.
+        quiet: true
+      loop: "{{ _perimeterd_api_response_json if _perimeterd_resolution_selector == 'latest-prerelease' else [] }}"
+      loop_control:
+        label: release-list entry
+
+    - name: Collect published prereleases in the returned window
+      ansible.builtin.set_fact:
+        _perimeterd_published_prerelease_candidates: >-
+          {{
+            _perimeterd_api_response_json
+            | selectattr('draft', 'equalto', false)
+            | selectattr('prerelease', 'equalto', true)
+            | list
+          }}
+
+    - name: Require a published prerelease in the returned window
+      ansible.builtin.assert:
+        that:
+          - _perimeterd_published_prerelease_candidates | length > 0
+        fail_msg: >-
+          No published perimeterd prerelease was found in the first 100 releases
+          returned by GitHub; pin an exact published tag or explicitly choose
+          latest for the stable channel. No further pages are requested.
+
+    - name: Validate ordering fields for published prerelease candidates
+      ansible.builtin.assert:
+        that:
+          - item.get('id') is integer
+          - item.get('id') | int > 0
+          - item.get('published_at') is string and item.get('published_at') is match('^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$')
+        fail_msg: A published prerelease has a malformed numeric ID or published_at timestamp.
+        quiet: true
+      loop: "{{ _perimeterd_published_prerelease_candidates if _perimeterd_resolution_selector == 'latest-prerelease' else [] }}"
+      loop_control:
+        label: prerelease ordering metadata
+
+    - name: Select greatest publication time then numeric release ID within the window
+      ansible.builtin.set_fact:
+        _perimeterd_api_response_json: >-
+          {{
+            _perimeterd_published_prerelease_candidates
+            | sort(attribute='id')
+            | sort(attribute='published_at')
+            | last
+          }}
+
+- name: Require a release object from the GitHub API
+  ansible.builtin.assert:
+    that:
+      - _perimeterd_api_response_json is mapping
+    fail_msg: GitHub release API returned a malformed release object.
+
+- name: Validate required release identity
+  ansible.builtin.assert:
+    that:
+      - _perimeterd_api_response_json.get('id') is integer
+      - _perimeterd_api_response_json.get('id') | int > 0
+      - _perimeterd_api_response_json.get('tag_name') is string and _perimeterd_api_response_json.get('tag_name') | length > 0
+      - _perimeterd_api_response_json.get('draft') is boolean
+      - _perimeterd_api_response_json.get('prerelease') is boolean
+    fail_msg: GitHub release API returned malformed release metadata.
+
+- name: Require exact tag equality for exact release pins
+  ansible.builtin.assert:
+    that:
+      - _perimeterd_api_response_json.get('tag_name') == _perimeterd_resolution_selector
+    fail_msg: GitHub returned a different tag than the exact perimeterd selector requested.
+  when: _perimeterd_resolution_selector not in ['latest', 'latest-prerelease']
+
+- name: Reject an unpublished draft release
+  ansible.builtin.assert:
+    that:
+      - _perimeterd_api_response_json.get('draft') == false
+    fail_msg: The selected perimeterd release is an unpublished draft.
+
+- name: Require a valid release publication timestamp
+  ansible.builtin.assert:
+    that:
+      - >-
+        _perimeterd_api_response_json.get('published_at') is string
+        and _perimeterd_api_response_json.get('published_at')
+        is match('^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$')
+    fail_msg: The selected perimeterd release has no valid published_at timestamp.
+
+- name: Require GitHub's designated latest release to be stable
+  ansible.builtin.assert:
+    that:
+      - _perimeterd_api_response_json.get('prerelease') == false
+    fail_msg: GitHub's latest release endpoint returned a prerelease instead of a stable release.
+  when: _perimeterd_resolution_selector == 'latest'
+
+- name: Store the selected release and tag
+  ansible.builtin.set_fact:
+    _perimeterd_release: "{{ _perimeterd_api_response_json }}"
+    _perimeterd_selected_tag: "{{ _perimeterd_api_response_json.get('tag_name') }}"
+
+- name: Validate selected release asset collection
+  ansible.builtin.assert:
+    that:
+      - _perimeterd_release.get('assets') is sequence
+      - _perimeterd_release.get('assets') is not string
+      - _perimeterd_release.get('assets') is not mapping
+    fail_msg: The selected perimeterd release has a malformed asset list.
+
+- name: Require mapping objects for release assets
+  ansible.builtin.assert:
+    that:
+      - item is mapping
+    fail_msg: The selected GitHub release contains a malformed asset object.
+    quiet: true
+  loop: "{{ _perimeterd_release.get('assets') }}"
+  loop_control:
+    label: release asset metadata
+
+- name: Require safe basenames for release assets
+  ansible.builtin.assert:
+    that:
+      - item.get('name') is string and item.get('name') is match('^[A-Za-z0-9](?:[A-Za-z0-9_.+-]*[A-Za-z0-9])?$')
+    fail_msg: A selected GitHub release contains an unsafe or malformed asset name.
+    quiet: true
+  loop: "{{ _perimeterd_release.get('assets') }}"
+  loop_control:
+    label: release asset name
+
+- name: Derive exact upstream package asset filename pattern
+  ansible.builtin.set_fact:
+    _perimeterd_package_asset_pattern: >-
+      {{
+        '^perimeterd_'
+        ~ ((_perimeterd_selected_tag | regex_replace('^v', '') | replace('~', '-')) | regex_escape)
+        ~ '-[0-9]+_' ~ _perimeterd_architecture ~ '[.]deb$'
+        if _perimeterd_package_format == 'deb'
+        else
+        '^perimeterd-'
+        ~ ((_perimeterd_selected_tag | regex_replace('^v', '') | replace('~', '-')) | regex_escape)
+        ~ '-[0-9]+[.]'
+        ~ ('x86_64' if _perimeterd_architecture == 'amd64' else 'aarch64')
+        ~ '[.]rpm$'
+      }}
+
+- name: Find matching native package assets and checksums manifest
+  ansible.builtin.set_fact:
+    _perimeterd_package_asset_matches: >-
+      {{
+        _perimeterd_release.get('assets')
+        | selectattr('name', 'match', _perimeterd_package_asset_pattern)
+        | list
+      }}
+    _perimeterd_checksums_asset_matches: >-
+      {{
+        _perimeterd_release.get('assets')
+        | selectattr('name', 'equalto', 'checksums.txt')
+        | list
+      }}
+
+- name: Require exactly one target-family package asset
+  ansible.builtin.assert:
+    that:
+      - _perimeterd_package_asset_matches | length == 1
+    fail_msg: >-
+      The selected perimeterd release must contain exactly one package matching
+      the selected family, architecture, tag and native revision; found
+      {{ _perimeterd_package_asset_matches | length }}.
+
+- name: Require exactly one checksums manifest in the selected release
+  ansible.builtin.assert:
+    that:
+      - _perimeterd_checksums_asset_matches | length == 1
+    fail_msg: >-
+      The selected perimeterd release must contain exactly one checksums.txt asset;
+      found {{ _perimeterd_checksums_asset_matches | length }}.
+
+- name: Validate selected package and checksum asset metadata
+  ansible.builtin.assert:
+    that:
+      - item.get('id') is integer
+      - item.get('id') | int > 0
+      - item.get('size') is integer
+      - item.get('size') | int > 0
+      - item.get('state') == 'uploaded'
+      - item.get('url') == 'https://api.github.com/repos/perimeterd/perimeterd/releases/assets/' ~ (item.get('id') | string)
+      - item.get('browser_download_url') == _perimeterd_expected_download_base ~ '/' ~ item.get('name')
+        or item.get('browser_download_url') == _perimeterd_expected_download_base_encoded ~ '/' ~ item.get('name')
+    fail_msg: The selected package or checksums asset is incomplete or has an untrusted download URL.
+    quiet: true
+  vars:
+    _perimeterd_expected_download_base: "https://github.com/perimeterd/perimeterd/releases/download/{{ _perimeterd_selected_tag }}"
+    _perimeterd_expected_download_base_encoded: "https://github.com/perimeterd/perimeterd/releases/download/{{ _perimeterd_selected_tag | urlencode }}"
+  loop:
+    - "{{ _perimeterd_package_asset_matches[0] }}"
+    - "{{ _perimeterd_checksums_asset_matches[0] }}"
+  loop_control:
+    label: selected release asset metadata
+
+- name: Export full selected upstream package and checksums asset mappings
+  ansible.builtin.set_fact:
+    _perimeterd_asset: "{{ _perimeterd_package_asset_matches[0] }}"
+    _perimeterd_checksums_asset: "{{ _perimeterd_checksums_asset_matches[0] }}"

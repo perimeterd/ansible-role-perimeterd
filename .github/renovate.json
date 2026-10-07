@@ -1,0 +1,103 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "enabledManagers": ["github-actions", "ansible-galaxy", "custom.regex"],
+  "dependencyDashboard": true,
+  "rangeStrategy": "pin",
+  "ansible-galaxy": {
+    "managerFilePatterns": ["/(^|/)requirements-collections(-legacy)?\\.ya?ml$/"]
+  },
+  "customManagers": [
+    {
+      "description": "Keep the workflow-pinned Ansible linter up to date",
+      "customType": "regex",
+      "managerFilePatterns": ["/^\\.github/workflows/[^/]+\\.ya?ml$/"],
+      "matchStrings": ["\\bansible-lint==(?<currentValue>[0-9]+\\.[0-9]+\\.[0-9]+)\\b"],
+      "depNameTemplate": "ansible-lint",
+      "datasourceTemplate": "pypi",
+      "versioningTemplate": "pep440"
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "Keep GitHub Actions on immutable commit SHAs",
+      "matchManagers": ["github-actions"],
+      "pinDigests": true,
+      "rangeStrategy": "pin"
+    },
+    {
+      "description": "Raise collection minimums without replacing compatibility ranges with exact pins",
+      "matchManagers": ["ansible-galaxy"],
+      "rangeStrategy": "bump"
+    },
+    {
+      "description": "Keep community.general below 12 for the supported legacy core 2.16 environment",
+      "matchManagers": ["ansible-galaxy"],
+      "matchFileNames": ["requirements-collections-legacy.yml"],
+      "matchPackageNames": ["community.general"],
+      "allowedVersions": "<12.0.0"
+    },
+    {
+      "description": "Keep controller Python changes coordinated with the manually maintained compatibility matrix",
+      "matchManagers": ["github-actions"],
+      "matchDepTypes": ["uses-with"],
+      "matchPackageNames": ["actions/python-versions"],
+      "enabled": false
+    },
+    {
+      "description": "Review breaking upgrades independently",
+      "matchUpdateTypes": ["major"],
+      "groupName": null,
+      "groupSlug": null
+    },
+    {
+      "description": "Group related CI setup actions",
+      "matchManagers": ["github-actions"],
+      "matchPackageNames": ["actions/checkout", "actions/setup-python"],
+      "matchUpdateTypes": ["minor", "patch", "pin", "pinDigest", "digest"],
+      "groupName": "CI setup actions",
+      "groupSlug": "ci-setup-actions"
+    },
+    {
+      "description": "Group CI artifact handling separately from controller setup",
+      "matchManagers": ["github-actions"],
+      "matchPackageNames": ["actions/upload-artifact", "actions/download-artifact"],
+      "matchUpdateTypes": ["minor", "patch", "pin", "pinDigest", "digest"],
+      "groupName": "CI artifact actions",
+      "groupSlug": "ci-artifact-actions"
+    },
+    {
+      "description": "Group hosted runner image updates separately from action commit updates",
+      "matchManagers": ["github-actions"],
+      "matchDepTypes": ["github-runner"],
+      "matchUpdateTypes": ["minor", "patch", "pin", "pinDigest", "digest"],
+      "groupName": "CI runner images",
+      "groupSlug": "ci-runner-images"
+    },
+    {
+      "description": "Group collections for current controller environments without restricting their major versions",
+      "matchManagers": ["ansible-galaxy"],
+      "matchFileNames": ["requirements-collections.yml"],
+      "matchUpdateTypes": ["minor", "patch", "pin", "pinDigest", "digest"],
+      "groupName": "Ansible collections",
+      "groupSlug": "ansible-collections"
+    },
+    {
+      "description": "Keep legacy collection changes separate from modern controller dependencies",
+      "matchManagers": ["ansible-galaxy"],
+      "matchFileNames": ["requirements-collections-legacy.yml"],
+      "matchUpdateTypes": ["minor", "patch", "pin", "pinDigest", "digest"],
+      "groupName": "Legacy Ansible collections",
+      "groupSlug": "legacy-ansible-collections"
+    },
+    {
+      "description": "Group pinned Ansible development tools",
+      "matchManagers": ["custom.regex"],
+      "matchDatasources": ["pypi"],
+      "matchPackageNames": ["ansible-lint"],
+      "matchUpdateTypes": ["minor", "patch", "pin", "pinDigest", "digest"],
+      "groupName": "Ansible development tools",
+      "groupSlug": "ansible-development-tools"
+    }
+  ]
+}

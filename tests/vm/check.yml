@@ -1,0 +1,20 @@
+---
+- name: Inspect perimeterd intent on a disposable VM
+  hosts: perimeterd
+  gather_facts: false
+  become: true
+  environment: "{{ smoke_transport_environment | default({}) }}"
+  tasks:
+    - name: Resolve release intent without installing or validating the configuration
+      ansible.builtin.include_role:
+        name: perimeterd
+      vars:
+        perimeterd_version: "{{ smoke_version }}"
+        perimeterd_config: "{{ smoke_config | default({'version': 1, 'firewall': {'backend': 'nftables'}, 'policies': []}) }}"
+        perimeterd_service_state: "{{ smoke_service_state | default('started') }}"
+        perimeterd_service_enabled: "{{ smoke_service_enabled | default(true) }}"
+        perimeterd_github_token: "{{ lookup('ansible.builtin.env', 'PERIMETERD_TEST_GITHUB_TOKEN') }}"
+
+    - name: Report the concrete release selected for VM lifecycle assertions
+      ansible.builtin.debug:
+        msg: "RESOLVED_TAG={{ _perimeterd_selected_tag }}"
