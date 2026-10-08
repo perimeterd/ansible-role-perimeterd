@@ -67,13 +67,13 @@ The VM runner configures named-role lookup itself. Activate the corresponding en
 
 ```sh
 # Debian: Python 3.13 / core 2.20 / modern collections
-python tests/vm/run.py --platform debian-amd64 \
+python tests/vm/run.py --platform debian-amd64 --require-kvm \
   --workdir "${HOME}/perimeterd-role-vm-debian-amd64"
 # Fedora: Python 3.14 / core 2.21 / modern collections
 python tests/vm/run.py --platform fedora-arm64 \
   --workdir "${HOME}/perimeterd-role-vm-fedora-arm64"
 # Rocky: Python 3.12 / core 2.16 / isolated legacy collections
-python tests/vm/run.py --platform rocky-amd64 \
+python tests/vm/run.py --platform rocky-amd64 --require-kvm \
   --workdir "${HOME}/perimeterd-role-vm-rocky-amd64"
 ```
 
@@ -84,7 +84,13 @@ sudo apt-get update
 sudo apt-get install --yes qemu-system-x86 qemu-system-arm qemu-efi-aarch64 qemu-utils genisoimage openssh-client
 ```
 
-Allow outbound HTTPS for cloud images, official GitHub artifacts and guest package repositories. Downloads can consume several GB; each guest has 2 GiB RAM and a 10 GiB overlay. KVM is used when available for the native architecture; cross-architecture ARM emulation can take hours. An optional `PERIMETERD_TEST_GITHUB_TOKEN` supplies the smoke play's GitHub API authentication; never commit a token.
+Allow outbound HTTPS for cloud images, official GitHub artifacts and guest package repositories. Downloads can consume several GB; each guest has 2 GiB RAM and a 10 GiB overlay. An optional `PERIMETERD_TEST_GITHUB_TOKEN` supplies the smoke play's GitHub API authentication; never commit a token.
+
+Local runs without `--require-kvm` automatically select KVM only for a native guest architecture with readable/writable `/dev/kvm`, otherwise TCG. Host aliases `x86_64`/`amd64` and `aarch64`/`arm64` are equivalent. `--require-kvm` requires both prerequisites before any image download or overlay creation and requests KVM only: failed initialization is an error, never a fallback to TCG. Device access alone does not prove acceleration works. The runner reports host/guest architecture and the selected accelerator before boot, then reports successful guest readiness separately. An owned QEMU process exiting during readiness fails promptly with the console-log path.
+
+Hosted Debian and Rocky jobs require KVM and grant device access only to the current disposable runner user; a missing KVM character device or broken virtualization fails the job. Fedora ARM64 remains on the hosted x86-64 runner with TCG. Cross-architecture emulation can take hours; the three controller profiles and both scenarios are unchanged.
+
+Every harness-launched Ansible play uses SSH pipelining via its subprocess-local `ANSIBLE_PIPELINING=True` environment, including check/diff, service-only, expected-failure and no-op calls. No repository/global Ansible configuration or production role default is changed. Cloud-init retains the passwordless-sudo test user; direct SSH/SCP, guest interpreters and file-transfer tasks retain their existing behavior.
 
 Use a separate `--workdir` per platform/run outside the role checkout. It retains image caches and diagnostics, including top-level `logs/` and scenario-specific `current-format/logs/` and `fresh-stale-inode/logs/`. Temporary SSH keys and overlays are removed and owned QEMU processes are terminated on exit. Without `--workdir`, the runner creates a temporary working directory; `--image-cache` can designate a shared image cache. Image URLs and checksums remain authoritative in the harness, not copied into this guide.
 
@@ -110,12 +116,24 @@ Repeat with `debian-amd64` and `fedora-arm64`, their matching environments, sepa
 
 A restricted local CONNECT/TLS fixture serves synthetic candidate release metadata and unchanged local package/checksum bytes at the official GitHub URLs. Its temporary CA is trusted only in explicit test settings; production URLs, TLS validation and global trust stores are not changed. Candidate mode never selects a hosted prerelease or requires an older development-release migration fixture.
 
-Each owned run uses two fresh overlays: the current-format lifecycle exercises ownership, packet enforcement, service/backend/reload/retry, check/no-op and stopped-state behavior; the fresh-start case introduces a byte-identical binary replacement to exercise stale-inode recovery. Do not use these scenarios against a production host. `--external-port` is only for an already isolated disposable guest in published mode, requires `--identity`, and cannot be combined with `--candidate-dist`.
+Each owned run uses two fresh overlays: the current-format lifecycle exercises ownership, packet enforcement, service/backend/reload/retry, check/no-op and stopped-state behavior; the fresh-start case introduces a byte-identical binary replacement to exercise stale-inode recovery. Do not use these scenarios against a production host. `--external-port` is only for an already isolated disposable guest in published mode, requires `--identity`, and cannot be combined with `--candidate-dist` or `--require-kvm`: the harness cannot certify an external VM's accelerator. Candidate mode supports `--require-kvm` and still owns both overlays.
+
+### Timings and diagnostics
+
+Each invocation initializes `workdir/logs/timings.jsonl`, then appends and flushes records as scopes finish, with concise `TIMING` completion lines in the live log. Elapsed seconds use a monotonic clock. Records contain `platform`, `mode` (`published`/`candidate`), `scenario` (null for run-wide work), `kind` (`run`/`scenario`/`phase`/`play`), `label`, numeric `elapsed_seconds`, `outcome`, `accelerator` (`kvm`/`tcg`, or `unknown`/`external`) and `version` (a concrete tag when known, otherwise null; never an unresolved `latest-prerelease`).
+
+Run-wide phases measure image fetch/checksum verification and shared key/candidate-fixture setup. Each owned scenario measures `boot-readiness`, `prerequisites`, `fixture-stack`, `lifecycle` and `cleanup`; every labeled play includes its Ansible process and harness outcome assertions. Scenario totals include diagnostics and teardown, and the harness total includes shared teardown. External mode retains its single lifecycle with run/lifecycle/play records, but no fabricated owned-boot phases.
+
+Durations are nested: plays are inside lifecycle phases, phases inside scenario totals, scenarios inside the run. Do not sum all records. Compare scenario totals and run-wide setup separately, then use phase/play costs to locate the bottleneck. The optimistic split bound is shared setup plus the slower scenario; independent jobs also duplicate setup/image transfer and add scheduling overhead. Collect comparable timings before proposing a separate matrix change; this harness does not split scenarios.
+
+A verified expected Ansible rejection records `expected_failure`, not a failed scenario. Unexpected results and recap/no-op/release-resolution assertions record `failed`; timeouts retain partial play output and record `timeout`; interruptions record `interrupted` when Python can unwind. Entered scopes emit records without suppressing the original failure or cleanup. Completed records survive later failures, but abrupt runner termination cannot guarantee a final record. Argument/candidate validation may fail before timing scopes are entered.
+
+CI attempts artifact upload on successful and failed jobs, best-effort on cancellation, using only `logs/`, `current-format/logs/` and `fresh-stale-inode/logs/`. These retain timings, consoles, per-play output, guest-stack information and failure diagnostics, not VM disks, SSH keys or fixture trust material. Missing logs from an early setup failure produce an upload warning. Local work directories retain the same evidence after cleanup.
 
 ## Hosted CI and dependency maintenance
 
-[Role CI](../.github/workflows/ci.yml) runs on pull requests, pushes to `main`, and reusable `workflow_call`. Pull requests run controller fixtures, smoke syntax and modern lint without VM execution or publication credentials. The VM job is conditional on the event being `push`: it runs on main pushes and when [signed-tag publication](releasing.md) calls reusable CI from its tag-push event. Release gates run at that tag, rather than trusting a previous main-push result. Failure diagnostics are uploaded by the VM workflow; consult its configured artifact paths when diagnosing a hosted failure. These are configured procedures, not a claim that a hosted run has completed.
+[Role CI](../.github/workflows/ci.yml) runs on pull requests, pushes to `main`, and reusable `workflow_call`. Pull requests run controller fixtures, smoke syntax and modern lint without VM execution or publication credentials. The VM job is conditional on the event being `push`: it runs on main pushes and when [signed-tag publication](releasing.md) calls reusable CI from its tag-push event. Release gates run at that tag, rather than trusting a previous main-push result. Successful and failed VM jobs upload the diagnostic directories described above. These are configured procedures, not a claim that a hosted run has completed.
 
 [Renovate policy](../.github/renovate.json) uses the recommended preset, a dependency dashboard and immutable Action commit pins. Major upgrades are reviewed independently. Non-major changes are grouped as CI setup actions, CI artifact actions, CI runner images, modern collections, legacy collections and Ansible development tools. A custom regex manager tracks the workflow's exact linter pin.
 
-The Galaxy manager includes both collection requirement files and bumps minimums without replacing compatibility ranges with exact pins. Modern collections remain uncapped; legacy `community.general` updates remain below 12 and retain that upper bound. Controller core/Python lines, the role's minimum core version, VM image URL/checksum pairs and explicit daemon fixture selections are manually coordinated. Automatic updates to `actions/setup-python`'s Python-version inputs are disabled. Update related compatibility documentation and gates together; keep source pins in their workflows and harnesses.
+The Galaxy manager includes both collection requirement files and bumps minimums without replacing compatibility ranges with exact pins. Renovate updates for `community.general` are disabled in both files; its compatibility requirements are maintained manually, with the legacy upper bound remaining below 12. Controller core/Python lines, the role's minimum core version, VM image URL/checksum pairs and explicit daemon fixture selections are manually coordinated. Automatic updates to `actions/setup-python`'s Python-version inputs are disabled. Update related compatibility documentation and gates together; keep source pins in their workflows and harnesses.

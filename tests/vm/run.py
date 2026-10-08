@@ -2,7 +2,7 @@
 """Run the real upstream package and systemd smoke matrix in disposable VMs."""
 
 import argparse
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 import hashlib
 import json
@@ -13,10 +13,14 @@ import shlex
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 from urllib.request import urlopen
-from candidate import Candidate, PackageFixture
+if __package__:
+    from .candidate import Candidate, PackageFixture
+else:
+    from candidate import Candidate, PackageFixture
 
 
 @dataclass(frozen=True)
@@ -80,7 +84,61 @@ def fetch_image(image, cache):
     return target
 
 
-def boot(image, disk, work, key):
+def select_accelerator(image, require_kvm=False):
+    host = os.uname().machine
+    aliases = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64"}
+    native = aliases.get(host, host) == aliases.get(image.architecture, image.architecture)
+    accessible = os.access("/dev/kvm", os.R_OK | os.W_OK)
+    if require_kvm and not native:
+        raise RuntimeError(f"KVM requires matching architectures: host={host}, guest={image.architecture}")
+    if require_kvm and not accessible:
+        raise RuntimeError("KVM required: /dev/kvm is missing or not readable/writable by the current user")
+    accelerator = "kvm" if native and accessible else "tcg"
+    print(f"Accelerator selected: host={host}, guest={image.architecture}, "
+          f"require_kvm={require_kvm}, accelerator={accelerator} (not yet boot verified)", flush=True)
+    return accelerator
+
+
+class Timings:
+    """Incremental nested elapsed observations; reporting must not mask failures."""
+
+    def __init__(self, logs, platform, mode, accelerator="unknown", version=None):
+        self.path = logs / "timings.jsonl"
+        self.path.write_text("")
+        self.platform, self.mode = platform, mode
+        self.accelerator, self.version = accelerator, version
+
+    @contextmanager
+    def measure(self, kind, label, *, scenario=None, started=None):
+        started = time.monotonic() if started is None else started
+        record = {"platform": self.platform, "mode": self.mode, "scenario": scenario,
+                  "kind": kind, "label": label, "outcome": "passed"}
+        try:
+            yield record
+        except BaseException as error:
+            record["outcome"] = (
+                "timeout" if isinstance(error, (subprocess.TimeoutExpired, TimeoutError)) else
+                "interrupted" if isinstance(error, (KeyboardInterrupt, SystemExit)) else "failed")
+            raise
+        finally:
+            record.update(elapsed_seconds=time.monotonic() - started,
+                          accelerator=self.accelerator, version=self.version)
+            try:
+                with self.path.open("a") as output:
+                    output.write(json.dumps(record) + "\n")
+                    output.flush()
+                print(f"TIMING {scenario or 'run-wide'}/{kind}/{label}: "
+                      f"{record['elapsed_seconds']:.3f}s {record['outcome']}", flush=True)
+            except OSError as error:
+                # A full disk or closed output pipe must not bypass VM teardown
+                # or replace the exception that triggered this record.
+                try:
+                    print(f"Cannot report timing to {self.path}: {error}", file=sys.stderr, flush=True)
+                except OSError:
+                    pass
+
+
+def boot(image, disk, work, key, accelerator):
     overlay = work / "guest.qcow2"
     run(["qemu-img", "create", "-f", "qcow2", "-F", "qcow2", "-b", str(disk), str(overlay), "10G"])
     pubkey = key.with_suffix(key.suffix + ".pub").read_text().strip().split(" ", 2)[:2]
@@ -103,8 +161,8 @@ def boot(image, disk, work, key):
     network = ("-netdev", f"user,id=network,hostfwd=tcp:127.0.0.1:{port}-:22",
                "-device", "virtio-net-pci,netdev=network")
     if image.architecture == "amd64":
-        machine = "q35,accel=kvm" if os.access("/dev/kvm", os.R_OK | os.W_OK) else "q35,accel=tcg"
-        argv = ["qemu-system-x86_64", "-machine", machine, "-cpu", "host" if "kvm" in machine else "max",
+        argv = ["qemu-system-x86_64", "-machine", f"q35,accel={accelerator}",
+                "-cpu", "host" if accelerator == "kvm" else "max",
                 "-smp", "2", "-m", "2048", "-drive", f"file={overlay},format=qcow2,if=virtio",
                 "-drive", f"file={seed},format=raw,readonly=on,if=virtio,media=cdrom"]
     else:
@@ -112,9 +170,8 @@ def boot(image, disk, work, key):
                                     "/usr/share/edk2/aarch64/QEMU_EFI.fd") if Path(f).exists()), None)
         if not firmware:
             raise RuntimeError("install qemu-efi-aarch64 or edk2-aarch64 to boot the arm64 VM")
-        native_arm = os.uname().machine in ("aarch64", "arm64") and os.access("/dev/kvm", os.R_OK | os.W_OK)
-        argv = ["qemu-system-aarch64", "-machine", "virt,accel=kvm" if native_arm else "virt",
-                "-cpu", "host" if native_arm else "cortex-a72", "-smp", "2", "-m", "2048",
+        argv = ["qemu-system-aarch64", "-machine", f"virt,accel={accelerator}",
+                "-cpu", "host" if accelerator == "kvm" else "cortex-a72", "-smp", "2", "-m", "2048",
                 "-bios", firmware, "-drive", f"if=none,file={overlay},format=qcow2,id=main",
                 "-device", "virtio-blk-pci,drive=main",
                 "-drive", f"if=none,file={seed},format=raw,readonly=on,id=seed",
@@ -130,8 +187,9 @@ def boot(image, disk, work, key):
 
 
 class Guest:
-    def __init__(self, port, key, logs, platform, candidate=None, fixture=None):
+    def __init__(self, port, key, logs, platform, candidate=None, fixture=None, *, timings, scenario=None):
         self.port, self.key, self.logs = port, key, logs
+        self.timings, self.scenario = timings, scenario
         self.python = "/usr/libexec/platform-python" if platform == "rocky-amd64" else "python3"
         self.version = candidate.version if candidate else CURRENT
         self.candidate, self.fixture = candidate, fixture
@@ -158,16 +216,24 @@ class Guest:
                     "ansible@127.0.0.1", command], timeout=timeout,
                    stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout.strip()
 
-    def ready(self):
+    def ready(self, process=None):
+        def check_process():
+            if process is not None and (status := process.poll()) is not None:
+                raise RuntimeError(f"QEMU exited during startup (exit={status}); "
+                                   f"inspect {self.logs / 'vm-console.log'}")
+
         deadline = time.monotonic() + 900
         last_error = None
         while time.monotonic() < deadline:
+            check_process()
             try:
                 self.ssh("cloud-init status --wait && sudo systemctl --version", timeout=90)
+                check_process()
                 print(f"disposable guest SSH ready on {self.port}", flush=True)
                 return
             except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
                 last_error = error
+                check_process()
                 time.sleep(4)
         raise TimeoutError(
             f"disposable VM did not complete cloud-init: {getattr(last_error, 'stderr', last_error)}"
@@ -216,45 +282,49 @@ class Guest:
 
     def play(self, label, *, version=None, config=None, state="started", enabled=True,
              check=False, fails=False, noop=False, diff=False, service=False, extra=None):
-        variables = {"smoke_version": version or self.version, "smoke_config": config or BASE_CONFIG,
-                     "smoke_service_state": state, "smoke_service_enabled": enabled,
-                     "smoke_transport_environment": self.guest_environment}
-        variables.update(extra or {})
-        playbook = "service.yml" if service else ("check.yml" if check else "smoke.yml")
-        argv = ["ansible-playbook", "-i", str(self.inventory), str(ROLE / "tests/vm" / playbook),
-                "-e", json.dumps(variables)]
-        if check:
-            argv.append("--check")
-        if diff:
-            argv.append("--diff")
-        env = dict(os.environ, ANSIBLE_NOCOLOR="1", ANSIBLE_HOST_KEY_CHECKING="False",
-                   ANSIBLE_ROLES_PATH=str(self.roles), **self.controller_environment)
-        try:
-            completed = subprocess.run(argv, text=True, stdin=subprocess.DEVNULL,
-                                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env, timeout=1000)
-        except subprocess.TimeoutExpired as error:
-            output = error.stdout or ""
-            if isinstance(output, bytes):
-                output = output.decode(errors="replace")
-            (self.logs / f"{label}.log").write_text(output)
-            raise
-        (self.logs / f"{label}.log").write_text(completed.stdout)
-        if (completed.returncode == 0) == fails:
-            raise AssertionError(f"{label}: unexpected Ansible result {completed.returncode}; inspect {self.logs / (label + '.log')}")
-        changed = re.search(r"(?m)^target\s+:.*?changed=(\d+)", completed.stdout)
-        if not fails and changed is None:
-            raise AssertionError(f"{label}: missing Ansible recap")
-        if noop and int(changed.group(1)) != 0:
-            raise AssertionError(f"{label}: expected zero changes, got {changed.group(1)}")
-        if not fails and not service and self.version == CURRENT and variables["smoke_version"] == CURRENT:
-            selected = re.search(r'RESOLVED_TAG=([^\s"]+)', completed.stdout)
-            if selected is None:
-                raise AssertionError(f"{label}: missing resolved prerelease tag")
-            self.version = selected.group(1)
-            print(f"Resolved published prerelease: {self.version}", flush=True)
-        print(f"{label}: {'expected failure' if fails else 'pass'}" +
-              (f", changed={changed.group(1)}" if changed else ""), flush=True)
-        return completed.stdout
+        with self.timings.measure("play", label, scenario=self.scenario) as timing:
+            variables = {"smoke_version": version or self.version, "smoke_config": config or BASE_CONFIG,
+                         "smoke_service_state": state, "smoke_service_enabled": enabled,
+                         "smoke_transport_environment": self.guest_environment}
+            variables.update(extra or {})
+            playbook = "service.yml" if service else ("check.yml" if check else "smoke.yml")
+            argv = ["ansible-playbook", "-i", str(self.inventory), str(ROLE / "tests/vm" / playbook),
+                    "-e", json.dumps(variables)]
+            if check:
+                argv.append("--check")
+            if diff:
+                argv.append("--diff")
+            env = dict(os.environ, ANSIBLE_NOCOLOR="1", ANSIBLE_HOST_KEY_CHECKING="False",
+                       ANSIBLE_PIPELINING="True", ANSIBLE_ROLES_PATH=str(self.roles),
+                       **self.controller_environment)
+            try:
+                completed = subprocess.run(argv, text=True, stdin=subprocess.DEVNULL,
+                                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env, timeout=1000)
+            except subprocess.TimeoutExpired as error:
+                output = error.stdout or ""
+                if isinstance(output, bytes):
+                    output = output.decode(errors="replace")
+                (self.logs / f"{label}.log").write_text(output)
+                raise
+            (self.logs / f"{label}.log").write_text(completed.stdout)
+            if (completed.returncode == 0) == fails:
+                raise AssertionError(f"{label}: unexpected Ansible result {completed.returncode}; inspect {self.logs / (label + '.log')}")
+            changed = re.search(r"(?m)^target\s+:.*?changed=(\d+)", completed.stdout)
+            if not fails and changed is None:
+                raise AssertionError(f"{label}: missing Ansible recap")
+            if noop and int(changed.group(1)) != 0:
+                raise AssertionError(f"{label}: expected zero changes, got {changed.group(1)}")
+            if not fails and not service and self.version == CURRENT and variables["smoke_version"] == CURRENT:
+                selected = re.search(r'RESOLVED_TAG=([^\s"]+)', completed.stdout)
+                if selected is None:
+                    raise AssertionError(f"{label}: missing resolved prerelease tag")
+                self.version = selected.group(1)
+                self.timings.version = self.version
+                print(f"Resolved published prerelease: {self.version}", flush=True)
+            timing["outcome"] = "expected_failure" if fails else "passed"
+            print(f"{label}: {'expected failure' if fails else 'pass'}" +
+                  (f", changed={changed.group(1)}" if changed else ""), flush=True)
+            return completed.stdout
 
 
     def until(self, command, needle, *, timeout=45):
@@ -799,14 +869,18 @@ def fresh_current_lifecycle(guest, platform):
 
 
 def main():
+    started = time.monotonic()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--platform", required=True, choices=sorted(IMAGES))
     parser.add_argument("--workdir", type=Path)
     parser.add_argument("--image-cache", type=Path)
+    parser.add_argument("--require-kvm", action="store_true", help="require native working KVM; never fall back to TCG")
     parser.add_argument("--external-port", type=int, help="reuse an already isolated/booted disposable VM (published mode only)")
     parser.add_argument("--identity", type=Path, help="SSH key for --external-port")
     parser.add_argument("--candidate-dist", type=Path, help="original GoReleaser dist with metadata.json, checksums.txt and native packages")
     args = parser.parse_args()
+    if args.require_kvm and args.external_port:
+        parser.error("--require-kvm cannot certify an --external-port guest; use a runner-owned VM")
     if args.candidate_dist and args.external_port:
         parser.error("--candidate-dist requires two runner-owned disposable overlays; --external-port is forbidden")
     if args.external_port and args.identity is None:
@@ -817,76 +891,102 @@ def main():
     workdir.mkdir(parents=True, exist_ok=True)
     logs = workdir / "logs"
     logs.mkdir(exist_ok=True)
-    if args.external_port:
-        exercise(Guest(args.external_port, args.identity, logs, args.platform), args.platform)
-        return
-    image = IMAGES[args.platform]
-    cache = (args.image_cache or workdir / "images").resolve()
-    disk = fetch_image(image, cache)
-    with ExitStack() as stack:
-        fixture = None
-        if candidate:
-            print("Transport: synthetic candidate release metadata + unaltered local package/manifest at original trusted TLS URLs", flush=True)
-            fixture = PackageFixture(candidate, logs)
-            stack.callback(fixture.close)
-        secrets = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="vm-keys-", dir=workdir)))
-        key = secrets / "ssh-key"
-        run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key)])
-        published_version = CURRENT
-        scenarios = (("current-format", exercise), ("fresh-stale-inode", fresh_current_lifecycle))
-        for scenario, execute in scenarios:
-            directory = workdir / scenario
-            scenario_logs = directory / "logs"
-            scenario_logs.mkdir(parents=True, exist_ok=True)
-            with tempfile.TemporaryDirectory(prefix="vm-overlay-", dir=directory) as overlay:
-                process, port, console = boot(image, disk, Path(overlay), key)
-                guest = None
-                try:
-                    guest = Guest(port, key, scenario_logs, args.platform, candidate, fixture)
-                    if not candidate:
-                        guest.version = published_version
-                    guest.ready()
-                    # Operator prerequisites before any restricted fixture environment.
-                    command = ("sudo apt-get update -qq && sudo apt-get install -y nftables iproute2 iputils-ping ca-certificates xz-utils"
-                               if args.platform.startswith("debian") else
-                               "sudo dnf install -y nftables iproute iputils ca-certificates && sudo dnf makecache")
-                    guest.ssh(command, timeout=600)
-                    stack_query = ("uname -r; nft --version; dpkg-query -W nftables libnftnl11; apt-get --version"
-                                   if args.platform.startswith("debian") else
-                                   "uname -r; nft --version; rpm -q nftables libnftnl; dnf --version")
-                    (scenario_logs / "guest-stack.log").write_text(guest.ssh(stack_query))
-                    guest.connect_fixture()
-                    execute(guest, args.platform)
-                    if not candidate:
-                        published_version = guest.version
-                except BaseException:
-                    if guest:
-                        for label, command in (
-                            ("daemon-journal", "sudo journalctl -u perimeterd.service -n 150 --no-pager"),
-                            ("nft-rules", "sudo nft -j list ruleset"),
-                            ("iptables-rules", "sudo iptables-save"),
-                            ("ipsets", "sudo ipset list"),
-                            ("native-package", "dpkg-query -W perimeterd 2>/dev/null || rpm -qi perimeterd"),
-                            ("service", "sudo systemctl status perimeterd.service --no-pager"),
-                        ):
-                            try:
-                                (scenario_logs / f"guest-{label}.log").write_text(guest.ssh(command, timeout=30))
-                            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
-                                output = "\\n".join(
-                                    part.decode(errors="replace") if isinstance(part, bytes) else part
-                                    for part in (error.stdout, error.stderr) if part)
-                                (scenario_logs / f"guest-{label}.log").write_text(output)
-                    raise
-                finally:
-                    if guest:
-                        guest.close()
-                    process.terminate()
+    timings = Timings(logs, args.platform, "candidate" if candidate else "published",
+                      accelerator="external" if args.external_port else "unknown",
+                      version=candidate.version if candidate else None)
+    with timings.measure("run", "harness", started=started):
+        if args.external_port:
+            guest = Guest(args.external_port, args.identity, logs, args.platform, timings=timings)
+            with timings.measure("phase", "lifecycle"):
+                exercise(guest, args.platform)
+            return
+        image = IMAGES[args.platform]
+        accelerator = select_accelerator(image, args.require_kvm)
+        timings.accelerator = accelerator
+        cache = (args.image_cache or workdir / "images").resolve()
+        with timings.measure("phase", "image-fetch"):
+            disk = fetch_image(image, cache)
+        with ExitStack() as stack:
+            with timings.measure("phase", "shared-setup"):
+                fixture = None
+                if candidate:
+                    print("Transport: synthetic candidate release metadata + unaltered local package/manifest at original trusted TLS URLs", flush=True)
+                    fixture = PackageFixture(candidate, logs)
+                    stack.callback(fixture.close)
+                secrets = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="vm-keys-", dir=workdir)))
+                key = secrets / "ssh-key"
+                run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key)])
+            published_version = CURRENT
+            scenarios = (("current-format", exercise), ("fresh-stale-inode", fresh_current_lifecycle))
+            for scenario, execute in scenarios:
+                with timings.measure("scenario", scenario, scenario=scenario):
+                    directory = workdir / scenario
+                    scenario_logs = directory / "logs"
+                    scenario_logs.mkdir(parents=True, exist_ok=True)
+                    overlay = process = console = guest = None
                     try:
-                        process.wait(timeout=15)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                        process.wait()
-                    console.close()
+                        with timings.measure("phase", "boot-readiness", scenario=scenario):
+                            overlay = tempfile.TemporaryDirectory(prefix="vm-overlay-", dir=directory)
+                            process, port, console = boot(image, disk, Path(overlay.name), key, accelerator)
+                            guest = Guest(port, key, scenario_logs, args.platform, candidate, fixture,
+                                          timings=timings, scenario=scenario)
+                            if not candidate:
+                                guest.version = published_version
+                            guest.ready(process)
+                            print(f"Guest successfully started: scenario={scenario}, accelerator={accelerator}", flush=True)
+                        with timings.measure("phase", "prerequisites", scenario=scenario):
+                            # Operator prerequisites before any restricted fixture environment.
+                            command = ("sudo apt-get update -qq && sudo apt-get install -y nftables iproute2 iputils-ping ca-certificates xz-utils"
+                                       if args.platform.startswith("debian") else
+                                       "sudo dnf install -y nftables iproute iputils ca-certificates && sudo dnf makecache")
+                            guest.ssh(command, timeout=600)
+                        with timings.measure("phase", "fixture-stack", scenario=scenario):
+                            stack_query = ("uname -r; nft --version; dpkg-query -W nftables libnftnl11; apt-get --version"
+                                           if args.platform.startswith("debian") else
+                                           "uname -r; nft --version; rpm -q nftables libnftnl; dnf --version")
+                            (scenario_logs / "guest-stack.log").write_text(guest.ssh(stack_query))
+                            guest.connect_fixture()
+                        with timings.measure("phase", "lifecycle", scenario=scenario):
+                            execute(guest, args.platform)
+                        if not candidate:
+                            published_version = guest.version
+                    except BaseException:
+                        if guest and process.poll() is None:
+                            for label, command in (
+                                ("daemon-journal", "sudo journalctl -u perimeterd.service -n 150 --no-pager"),
+                                ("nft-rules", "sudo nft -j list ruleset"),
+                                ("iptables-rules", "sudo iptables-save"),
+                                ("ipsets", "sudo ipset list"),
+                                ("native-package", "dpkg-query -W perimeterd 2>/dev/null || rpm -qi perimeterd"),
+                                ("service", "sudo systemctl status perimeterd.service --no-pager"),
+                            ):
+                                try:
+                                    (scenario_logs / f"guest-{label}.log").write_text(guest.ssh(command, timeout=30))
+                                except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+                                    output = "\\n".join(
+                                        part.decode(errors="replace") if isinstance(part, bytes) else part
+                                        for part in (error.stdout, error.stderr) if part)
+                                    (scenario_logs / f"guest-{label}.log").write_text(output)
+                        raise
+                    finally:
+                        with timings.measure("phase", "cleanup", scenario=scenario):
+                            try:
+                                if guest:
+                                    guest.close()
+                            finally:
+                                try:
+                                    if process:
+                                        process.terminate()
+                                        try:
+                                            process.wait(timeout=15)
+                                        except subprocess.TimeoutExpired:
+                                            process.kill()
+                                            process.wait()
+                                finally:
+                                    if console:
+                                        console.close()
+                                    if overlay:
+                                        overlay.cleanup()
 
 
 if __name__ == "__main__":

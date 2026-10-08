@@ -68,14 +68,17 @@ jobs:
             ansible_core: '2.20'
             python: '3.13'
             collection_requirements: requirements-collections.yml
+            require_kvm: true
           - platform: fedora-arm64
             ansible_core: '2.21'
             python: '3.14'
             collection_requirements: requirements-collections.yml
+            require_kvm: false
           - platform: rocky-amd64
             ansible_core: '2.16'
             python: '3.12'
             collection_requirements: requirements-collections-legacy.yml
+            require_kvm: true
     steps:
       - name: Check out role
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -89,6 +92,22 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes qemu-system-x86 qemu-system-arm qemu-efi-aarch64 qemu-utils genisoimage openssh-client
+      - name: Require runner-user KVM access
+        if: matrix.require_kvm
+        run: |
+          set -euo pipefail
+          if [[ ! -c /dev/kvm ]]; then
+            echo 'Required KVM character device /dev/kvm is unavailable on this hosted runner' >&2
+            exit 1
+          fi
+          sudo chown "$(id -u):$(id -g)" /dev/kvm
+          sudo chmod 0600 /dev/kvm
+          uname -m
+          stat -c '%A %U:%G %n' /dev/kvm
+          if [[ ! -r /dev/kvm || ! -w /dev/kvm ]]; then
+            echo 'Current runner user cannot read/write required /dev/kvm' >&2
+            exit 1
+          fi
       - name: Install the matching controller and collection requirements
         run: |
           python -m pip install "ansible-core==${{ matrix.ansible_core }}.*"
@@ -96,11 +115,20 @@ jobs:
       - name: Exercise real package and service in isolated VM
         env:
           PERIMETERD_TEST_GITHUB_TOKEN: ${{ github.token }}
-        run: python tests/vm/run.py --platform '${{ matrix.platform }}' --workdir '${{ runner.temp }}/perimeterd-role-vm'
+          REQUIRE_KVM: ${{ matrix.require_kvm }}
+        run: |
+          args=(--platform '${{ matrix.platform }}' --workdir '${{ runner.temp }}/perimeterd-role-vm')
+          if [[ "$REQUIRE_KVM" == 'true' ]]; then
+            args+=(--require-kvm)
+          fi
+          python tests/vm/run.py "${args[@]}"
       - name: Upload VM diagnostics
-        if: failure()
+        if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: role-vm-${{ matrix.platform }}
-          path: ${{ runner.temp }}/perimeterd-role-vm/logs/
+          path: |
+            ${{ runner.temp }}/perimeterd-role-vm/logs/
+            ${{ runner.temp }}/perimeterd-role-vm/current-format/logs/
+            ${{ runner.temp }}/perimeterd-role-vm/fresh-stale-inode/logs/
           if-no-files-found: warn
