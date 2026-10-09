@@ -10,6 +10,7 @@ import tempfile
 import unittest
 
 from vm.candidate import API, Candidate, PackageFixture, asset_name
+from .test_vm_harness import owned_run
 
 VERSION = "0.0.1-dev.8.g123456789abc"
 
@@ -76,6 +77,26 @@ class CandidateArtifact(unittest.TestCase):
                 (self.dist / "metadata.json").write_text(json.dumps(metadata))
                 with self.assertRaises(ValueError):
                     Candidate(self.dist, "debian-amd64")
+
+
+    @unittest.skipUnless(shutil.which("openssl"), "openssl is required for trusted TLS transport")
+    def test_scenario_selection_preserves_validated_candidate_and_scoped_trust(self):
+        for selection, expected in ((None, ["current-format", "fresh-stale-inode"]),
+                                    ("fresh-stale-inode", ["fresh-stale-inode"])):
+            with self.subTest(selection=selection):
+                work = self.work / (selection or "both")
+                arguments = ["--candidate-dist", str(self.dist)]
+                if selection:
+                    arguments += ["--scenario", selection]
+                seen, records = owned_run(work, arguments)
+                self.assertEqual([row[0] for row in seen], expected)
+                self.assertEqual({row[1] for row in seen}, {VERSION})
+                for _scenario, _version, candidate, fixture in seen:
+                    self.assertEqual(candidate.package, self.package.read_bytes())
+                    self.assertEqual(candidate.manifest, self.manifest.encode())
+                    self.assertFalse(fixture.cert.exists())
+                self.assertEqual({record["version"] for record in records}, {VERSION})
+                self.assertEqual({record["mode"] for record in records}, {"candidate"})
 
     def fixture_get(self, fixture, host, path, header_host=None):
         context = ssl.create_default_context(cafile=str(fixture.cert))

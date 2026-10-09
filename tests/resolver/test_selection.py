@@ -13,6 +13,9 @@ import subprocess
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
+
+from vm import run as harness
 
 ROLE = Path(__file__).resolve().parents[2]
 API = "/repos/perimeterd/perimeterd/releases"
@@ -36,6 +39,18 @@ def release(tag, *, published="2026-09-26T12:00:00Z", identifier=12,
     return {"id": identifier, "tag_name": tag, "published_at": published,
             "created_at": "2026-09-25T12:00:00Z", "draft": draft,
             "prerelease": prerelease, "assets": assets}
+
+
+def arm_release(tag, **kwargs):
+    """Keep ARM requirements confined to the shared-Fedora resolver coverage."""
+    payload = release(tag, **kwargs)
+    if kwargs.get("packages", True):
+        package = dict(payload["assets"][-1])
+        package["name"] = f"perimeterd-{tag.removeprefix('v')}-1.aarch64.rpm"
+        package["browser_download_url"] = (
+            f"https://github.com/perimeterd/perimeterd/releases/download/{tag}/{package['name']}")
+        payload["assets"] = [payload["assets"][0], package]
+    return payload
 
 
 class FixtureProxy(BaseHTTPRequestHandler):
@@ -127,12 +142,15 @@ class ResolverWithAnsible(unittest.TestCase):
         self.server.routes = {}
         self.server.calls = []
 
+    def fixture_environment(self):
+        return dict(os.environ, HTTPS_PROXY=f"http://127.0.0.1:{self.server.server_port}",
+                    https_proxy=f"http://127.0.0.1:{self.server.server_port}",
+                    HTTP_PROXY="", http_proxy="", ALL_PROXY="", all_proxy="",
+                    NO_PROXY="", no_proxy="", SSL_CERT_FILE=str(self.cert),
+                    ANSIBLE_NOCOLOR="1", PERIMETERD_TEST_GITHUB_TOKEN=SECRET)
+
     def invoke(self, selector="latest", *, success=True):
-        env = dict(os.environ, HTTPS_PROXY=f"http://127.0.0.1:{self.server.server_port}",
-                   https_proxy=f"http://127.0.0.1:{self.server.server_port}",
-                   HTTP_PROXY="", http_proxy="", ALL_PROXY="", all_proxy="",
-                   NO_PROXY="", no_proxy="", SSL_CERT_FILE=str(self.cert),
-                   ANSIBLE_NOCOLOR="1")
+        env = self.fixture_environment()
         result = subprocess.run(
             ["ansible-playbook", "-i", "fixture,", str(self.playbook), "-e",
              json.dumps({"perimeterd_version": selector})],
@@ -148,6 +166,122 @@ class ResolverWithAnsible(unittest.TestCase):
             self.assertEqual(token, f"Bearer {SECRET}")
             self.assertEqual(api_version, "2026-03-10")
         return result.stdout
+
+    def invoke_release_playbook(self, work, *, output=True, success=True):
+        roles = work / "roles"
+        roles.mkdir(exist_ok=True)
+        (roles / "perimeterd").symlink_to(ROLE, target_is_directory=True)
+        destination = work / "release.json"
+        variables = {"perimeterd_download_timeout": 10}
+        if output is not False:
+            variables["vm_release_output"] = str(destination) if output is True else output
+        result = subprocess.run(
+            ["ansible-playbook", "-i", "localhost,", str(ROLE / "tests/vm/resolve-release.yml"),
+             "-e", json.dumps(variables)],
+            cwd=ROLE, env=dict(self.fixture_environment(), ANSIBLE_ROLES_PATH=str(roles)),
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120)
+        self.assertNotIn(SECRET, result.stdout)
+        self.assertEqual(result.returncode == 0, success, result.stdout)
+        for _path, token, api_version in self.server.calls:
+            self.assertEqual(token, f"Bearer {SECRET}")
+            self.assertEqual(api_version, "2026-03-10")
+        return destination
+
+    def test_fedora_release_playbook_writes_only_selected_arm_tag(self):
+        tag = "v1.2.3-dev.7+build.4"
+        self.server.routes[API + "?per_page=100"] = (
+            200, [arm_release(tag, prerelease=True)], {})
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = self.invoke_release_playbook(Path(temporary))
+            self.assertEqual(json.loads(destination.read_text()), {"tag": tag})
+        self.assertEqual([path for path, *_ in self.server.calls], [API + "?per_page=100"])
+
+    def test_fedora_release_playbook_failure_has_no_tag_output(self):
+        tag = "1.2.3-dev.7"
+        missing_checksum = arm_release(tag, prerelease=True)
+        missing_checksum["assets"] = missing_checksum["assets"][1:]
+        cases = {
+            "missing ARM package": (200, [release(tag, prerelease=True)], {}),
+            "missing checksum": (200, [missing_checksum], {}),
+            "API failure": (401, {"message": "Bad credentials"}, {}),
+        }
+        for name, response in cases.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
+                self.server.calls = []
+                self.server.routes[API + "?per_page=100"] = response
+                destination = self.invoke_release_playbook(Path(temporary), success=False)
+                self.assertFalse(destination.exists())
+                self.assertEqual([path for path, *_ in self.server.calls], [API + "?per_page=100"])
+
+    def test_fedora_release_playbook_requires_output_before_api(self):
+        for output in (False, "", "   ", 42):
+            with self.subTest(output=output), tempfile.TemporaryDirectory() as temporary:
+                destination = self.invoke_release_playbook(
+                    Path(temporary), output=output, success=False)
+                self.assertFalse(destination.exists())
+            self.assertEqual(self.server.calls, [])
+
+    def test_shared_fedora_selection_pins_real_guest_resolver_after_channel_moves(self):
+        tag = "v1.2.3-dev.7+build.4"
+        list_route = API + "?per_page=100"
+        exact_route = API + "/tags/v1.2.3-dev.7%2Bbuild.4"
+        self.server.routes[list_route] = (200, [arm_release(tag, prerelease=True)], {})
+        with tempfile.TemporaryDirectory() as temporary:
+            work = Path(temporary)
+            destination = self.invoke_release_playbook(work)
+            selected = json.loads(destination.read_text())["tag"]
+            self.server.routes[list_route] = (
+                200, [arm_release("v1.2.3-dev.8+build.5", identifier=99, prerelease=True)], {})
+            self.server.routes[exact_route] = (200, arm_release(tag, prerelease=True), {})
+            playbook = work / "pinned-resolver.yml"
+            playbook.write_text(
+                "---\n- hosts: target\n  connection: local\n  gather_facts: false\n"
+                "  become: false\n  vars:\n"
+                "    ansible_python_interpreter: '{{ ansible_playbook_python }}'\n"
+                "    perimeterd_version: '{{ smoke_version }}'\n"
+                "    perimeterd_github_token: \"{{ lookup('ansible.builtin.env', 'PERIMETERD_TEST_GITHUB_TOKEN') }}\"\n"
+                "    perimeterd_download_timeout: 10\n"
+                "    _perimeterd_package_format: rpm\n    _perimeterd_architecture: arm64\n"
+                "  tasks:\n    - ansible.builtin.include_role:\n"
+                "        name: perimeterd\n        tasks_from: resolve\n"
+                "    - ansible.builtin.debug:\n"
+                "        msg: 'RESOLVED_TAG={{ _perimeterd_selected_tag }}'\n")
+            logs = work / "logs"
+            logs.mkdir()
+            timings = harness.Timings(logs, "fedora-arm64", "published", "tcg", selected)
+            guest = harness.Guest(1, work / "unused-key", logs, "fedora-arm64",
+                                  timings=timings, scenario="current-format", release_tag=selected)
+            fixture_env = self.fixture_environment()
+            guest.controller_environment = {
+                name: fixture_env[name] for name in (
+                    "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
+                    "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy",
+                    "SSL_CERT_FILE", "PERIMETERD_TEST_GITHUB_TOKEN")}
+            real_run = subprocess.run
+
+            def local_resolver(argv, **kwargs):
+                # Substitute transport/playbook only; Guest.play supplies the real baseline variables.
+                argv = list(argv)
+                self.assertEqual(argv[0], "ansible-playbook")
+                self.assertEqual(Path(argv[3]).parent, ROLE / "tests/vm")
+                argv[2:4] = ["target,", str(playbook)]
+                return real_run(argv, **kwargs)
+
+            with patch.object(harness.subprocess, "run", side_effect=local_resolver):
+                for label in ("initial", "repeat"):
+                    self.assertIn(f"RESOLVED_TAG={tag}", guest.play(label))
+            self.assertEqual(guest.version, tag)
+            self.assertEqual(timings.version, tag)
+            records = [json.loads(line) for line in timings.path.read_text().splitlines()]
+            self.assertEqual([record["version"] for record in records], [tag, tag])
+            self.assertEqual([record["scenario"] for record in records],
+                             ["current-format", "current-format"])
+            self.assertEqual([record["outcome"] for record in records], ["passed", "passed"])
+        self.assertEqual([path for path, *_ in self.server.calls],
+                         [list_route, exact_route, exact_route])
+        for _path, token, api_version in self.server.calls:
+            self.assertEqual(token, f"Bearer {SECRET}")
+            self.assertEqual(api_version, "2026-03-10")
 
     def test_latest_uses_github_designated_stable_without_listing_prereleases(self):
         self.server.routes[API + "/latest"] = (200, release("1.2.3"), {})

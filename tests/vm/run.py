@@ -53,6 +53,18 @@ SSH_OPTIONS = ("-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/
                "-o", "BatchMode=yes", "-o", "ConnectTimeout=8")
 
 
+def release_tag(value):
+    """Accept exact tags using the role's SemVer grammar, without normalization."""
+    numeric = r"(?:0|[1-9][0-9]*)"
+    prerelease = rf"(?:{numeric}|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)"
+    pattern = (rf"v?{numeric}\.{numeric}\.{numeric}"
+               rf"(?:-{prerelease}(?:\.{prerelease})*)?"
+               r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?")
+    if re.fullmatch(pattern, value) is None:
+        raise argparse.ArgumentTypeError("--release-tag requires an exact SemVer daemon tag")
+    return value
+
+
 def run(argv, *, timeout=180, **kwargs):
     return subprocess.run(argv, check=True, timeout=timeout, text=True, **kwargs)
 
@@ -187,11 +199,12 @@ def boot(image, disk, work, key, accelerator):
 
 
 class Guest:
-    def __init__(self, port, key, logs, platform, candidate=None, fixture=None, *, timings, scenario=None):
+    def __init__(self, port, key, logs, platform, candidate=None, fixture=None, *,
+                 timings, scenario=None, release_tag=None):
         self.port, self.key, self.logs = port, key, logs
         self.timings, self.scenario = timings, scenario
         self.python = "/usr/libexec/platform-python" if platform == "rocky-amd64" else "python3"
-        self.version = candidate.version if candidate else CURRENT
+        self.version = candidate.version if candidate else (release_tag or CURRENT)
         self.candidate, self.fixture = candidate, fixture
         self.forward = None
         self.controller_environment = fixture.environment(fixture.cert) if fixture else {}
@@ -868,6 +881,9 @@ def fresh_current_lifecycle(guest, platform):
     print(f"fresh current-format stale-inode lifecycle PASS: {platform}", flush=True)
 
 
+SCENARIOS = {"current-format": exercise, "fresh-stale-inode": fresh_current_lifecycle}
+
+
 def main():
     started = time.monotonic()
     parser = argparse.ArgumentParser(description=__doc__)
@@ -875,28 +891,40 @@ def main():
     parser.add_argument("--workdir", type=Path)
     parser.add_argument("--image-cache", type=Path)
     parser.add_argument("--require-kvm", action="store_true", help="require native working KVM; never fall back to TCG")
+    parser.add_argument("--scenario", choices=("all", *SCENARIOS),
+                        help="owned VM scenario (default: both, in order); forbidden for external guests")
+    parser.add_argument("--release-tag", type=release_tag,
+                        help="exact published daemon tag (default: discover latest-prerelease)")
     parser.add_argument("--external-port", type=int, help="reuse an already isolated/booted disposable VM (published mode only)")
     parser.add_argument("--identity", type=Path, help="SSH key for --external-port")
     parser.add_argument("--candidate-dist", type=Path, help="original GoReleaser dist with metadata.json, checksums.txt and native packages")
     args = parser.parse_args()
     if args.require_kvm and args.external_port:
         parser.error("--require-kvm cannot certify an --external-port guest; use a runner-owned VM")
+    if args.scenario is not None and args.external_port:
+        parser.error("--scenario is forbidden with --external-port")
+    if args.release_tag is not None and args.candidate_dist:
+        parser.error("--release-tag is forbidden with --candidate-dist; candidate metadata is authoritative")
     if args.candidate_dist and args.external_port:
-        parser.error("--candidate-dist requires two runner-owned disposable overlays; --external-port is forbidden")
+        parser.error("--candidate-dist requires runner-owned disposable overlays; --external-port is forbidden")
     if args.external_port and args.identity is None:
         parser.error("--identity is required with --external-port")
     candidate = Candidate(args.candidate_dist, args.platform) if args.candidate_dist else None
-    print(f"MODE: {'local candidate ' + candidate.version + ' (two owned overlays)' if candidate else 'published release ' + CURRENT}", flush=True)
+    scenarios = SCENARIOS if args.scenario in (None, "all") else {args.scenario: SCENARIOS[args.scenario]}
+    published_version = args.release_tag or CURRENT
+    print(f"MODE: {'local candidate ' + candidate.version if candidate else 'published release ' + published_version}; "
+          f"scenarios={','.join(scenarios) if not args.external_port else 'external current-format'}", flush=True)
     workdir = (args.workdir or Path(tempfile.mkdtemp(prefix="perimeterd-role-vm-"))).resolve()
     workdir.mkdir(parents=True, exist_ok=True)
     logs = workdir / "logs"
     logs.mkdir(exist_ok=True)
     timings = Timings(logs, args.platform, "candidate" if candidate else "published",
                       accelerator="external" if args.external_port else "unknown",
-                      version=candidate.version if candidate else None)
+                      version=candidate.version if candidate else args.release_tag)
     with timings.measure("run", "harness", started=started):
         if args.external_port:
-            guest = Guest(args.external_port, args.identity, logs, args.platform, timings=timings)
+            guest = Guest(args.external_port, args.identity, logs, args.platform,
+                          timings=timings, release_tag=args.release_tag)
             with timings.measure("phase", "lifecycle"):
                 exercise(guest, args.platform)
             return
@@ -916,9 +944,7 @@ def main():
                 secrets = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="vm-keys-", dir=workdir)))
                 key = secrets / "ssh-key"
                 run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key)])
-            published_version = CURRENT
-            scenarios = (("current-format", exercise), ("fresh-stale-inode", fresh_current_lifecycle))
-            for scenario, execute in scenarios:
+            for scenario, execute in scenarios.items():
                 with timings.measure("scenario", scenario, scenario=scenario):
                     directory = workdir / scenario
                     scenario_logs = directory / "logs"
@@ -929,9 +955,7 @@ def main():
                             overlay = tempfile.TemporaryDirectory(prefix="vm-overlay-", dir=directory)
                             process, port, console = boot(image, disk, Path(overlay.name), key, accelerator)
                             guest = Guest(port, key, scenario_logs, args.platform, candidate, fixture,
-                                          timings=timings, scenario=scenario)
-                            if not candidate:
-                                guest.version = published_version
+                                          timings=timings, scenario=scenario, release_tag=published_version)
                             guest.ready(process)
                             print(f"Guest successfully started: scenario={scenario}, accelerator={accelerator}", flush=True)
                         with timings.measure("phase", "prerequisites", scenario=scenario):

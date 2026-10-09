@@ -1,4 +1,5 @@
 """Behavioral boundaries for owned acceleration, readiness and partial timings."""
+from contextlib import ExitStack
 import json
 from pathlib import Path
 import subprocess
@@ -9,6 +10,136 @@ import unittest
 from unittest.mock import Mock, patch
 
 from vm import run as harness
+
+
+def owned_run(work, arguments=(), *, failure=None):
+    """Exercise owned resource orchestration with a minimal play lifecycle."""
+    seen, processes, overlays, fixtures = [], [], [], []
+    tag = "v1.2.3-dev.4+build.05"
+
+    def boot(image, disk, directory, key, accelerator):
+        overlays.append(directory)
+        assert not (directory / "installed-state").exists()
+        process = Mock()
+        process.poll.return_value = None
+        processes.append(process)
+        return process, 22, (directory.parent / "logs" / "vm-console.log").open("w")
+
+    def execute(guest, platform):
+        directory = overlays[-1]
+        seen.append((guest.scenario, guest.version, guest.candidate, guest.fixture))
+        if guest.fixture:
+            fixtures.append(guest.fixture)
+            assert guest.fixture.cert.exists()
+            assert guest.controller_environment["SSL_CERT_FILE"] == str(guest.fixture.cert)
+        guest.play("baseline")
+        (directory / "installed-state").write_text(guest.version)
+        if failure:
+            raise failure
+
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(sys, "argv", [
+            "run.py", "--platform", "debian-amd64", "--workdir", str(work), *arguments]))
+        stack.enter_context(patch.object(harness, "fetch_image", return_value=work / "base.qcow2"))
+        stack.enter_context(patch.object(harness, "select_accelerator", return_value="kvm"))
+        stack.enter_context(patch.object(harness, "boot", side_effect=boot))
+        stack.enter_context(patch.object(harness.Guest, "ready"))
+        stack.enter_context(patch.object(harness.Guest, "ssh", return_value="test stack"))
+        stack.enter_context(patch.object(harness.Guest, "connect_fixture"))
+        stack.enter_context(patch.dict(harness.SCENARIOS, {
+            "current-format": execute, "fresh-stale-inode": execute}))
+        original_run = harness.subprocess.run
+
+        def subprocess_run(argv, **kwargs):
+            if argv[0] == "ansible-playbook":
+                return subprocess.CompletedProcess(argv, 0, f"target : changed=0\nRESOLVED_TAG={tag}")
+            return original_run(argv, **kwargs)
+
+        stack.enter_context(patch.object(harness.subprocess, "run", side_effect=subprocess_run))
+        try:
+            harness.main()
+        finally:
+            for directory, process in zip(overlays, processes):
+                assert not directory.exists(), "owned overlay survived teardown"
+                process.terminate.assert_called_once()
+                process.wait.assert_called_once()
+            assert not tuple(work.glob("vm-keys-*")), "SSH keys survived shared teardown"
+            for fixture in fixtures:
+                assert not fixture.cert.exists(), "fixture trust survived shared teardown"
+    records = [json.loads(line) for line in (work / "logs/timings.jsonl").read_text().splitlines()]
+    return seen, records
+
+
+class ScenarioTests(unittest.TestCase):
+    def test_default_discovers_once_and_reuses_tag_in_isolated_overlays(self):
+        with tempfile.TemporaryDirectory() as directory:
+            seen, records = owned_run(Path(directory))
+        self.assertEqual([(scenario, version) for scenario, version, *_ in seen],
+                         [("current-format", harness.CURRENT), ("fresh-stale-inode", "v1.2.3-dev.4+build.05")])
+        self.assertEqual([(r["label"], r["version"], r["outcome"]) for r in records if r["kind"] == "scenario"],
+                         [("current-format", "v1.2.3-dev.4+build.05", "passed"),
+                          ("fresh-stale-inode", "v1.2.3-dev.4+build.05", "passed")])
+
+    def test_selected_scenario_is_pristine_and_exact_tag_is_baseline(self):
+        for scenario in harness.SCENARIOS:
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as directory:
+                work = Path(directory)
+                seen, records = owned_run(work, ["--scenario", scenario, "--release-tag", "v1.2.3+build.01"])
+                self.assertEqual([(name, version) for name, version, *_ in seen], [(scenario, "v1.2.3+build.01")])
+                self.assertFalse((work / next(name for name in harness.SCENARIOS if name != scenario)).exists())
+                self.assertEqual({r["version"] for r in records}, {"v1.2.3+build.01"})
+                self.assertEqual({r["scenario"] for r in records if r["kind"] == "scenario"}, {scenario})
+
+    def test_selected_failure_cleans_up_and_retains_failed_timings(self):
+        error = RuntimeError("lifecycle failure")
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            with self.assertRaises(RuntimeError) as result:
+                owned_run(work, ["--scenario", "fresh-stale-inode"], failure=error)
+            self.assertIs(result.exception, error)
+            records = [json.loads(line) for line in (work / "logs/timings.jsonl").read_text().splitlines()]
+            self.assertEqual([(r["label"], r["outcome"]) for r in records if r["kind"] in ("scenario", "run")],
+                             [("fresh-stale-inode", "failed"), ("harness", "failed")])
+            self.assertTrue((work / "fresh-stale-inode/logs/guest-daemon-journal.log").exists())
+
+    def test_external_default_retains_one_lifecycle_and_exact_baseline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            with patch.object(sys, "argv", [
+                    "run.py", "--platform", "debian-amd64", "--workdir", str(work),
+                    "--external-port", "22", "--identity", str(work / "key"), "--release-tag", "v1.2.3-dev.4"]), \
+                    patch.object(harness, "exercise") as exercise, patch.object(harness, "boot") as boot:
+                harness.main()
+            guest = exercise.call_args.args[0]
+            self.assertEqual(guest.version, "v1.2.3-dev.4")
+            boot.assert_not_called()
+            records = [json.loads(line) for line in (work / "logs/timings.jsonl").read_text().splitlines()]
+            self.assertEqual([(r["kind"], r["accelerator"], r["version"]) for r in records],
+                             [("phase", "external", "v1.2.3-dev.4"), ("run", "external", "v1.2.3-dev.4")])
+
+    def test_invalid_arguments_fail_before_any_work_or_contact(self):
+        cases = [["--scenario", "unknown"],
+                 ["--release-tag", "1.2.3", "--candidate-dist", "/missing/dist"],
+                 ["--candidate-dist", "/missing/dist", "--external-port", "22"]]
+        cases += [["--release-tag", tag] for tag in (
+            "", "latest", "latest-prerelease", "1.2", "01.2.3", "1.2.3-01", "1.2.3-a..b",
+            " 1.2.3", "1.2.3 ", "1.2.3\n", "1.2.3\ninjected=output", "1.2.3+")]
+        cases += [["--external-port", "22", "--scenario", scenario] for scenario in ("all", *harness.SCENARIOS)]
+        for arguments in cases:
+            with self.subTest(arguments=arguments), tempfile.TemporaryDirectory() as directory:
+                work = Path(directory) / "untouched"
+                result = subprocess.run(
+                    [sys.executable, str(harness.ROLE / "tests/vm/run.py"), "--platform", "debian-amd64",
+                     "--workdir", str(work), "--identity", "/missing/key", *arguments],
+                    text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertFalse(work.exists())
+
+    def test_supported_exact_tag_forms_are_not_normalized(self):
+        for tag in ("0.0.0", "1.2.3", "v1.2.3", "1.2.3-0", "1.2.3-dev.12",
+                    "v1.2.3-rc.1+build.01", "1.2.3-01a", "1.2.3+001"):
+            with self.subTest(tag=tag):
+                self.assertEqual(harness.release_tag(tag), tag)
 
 
 class AcceleratorTests(unittest.TestCase):

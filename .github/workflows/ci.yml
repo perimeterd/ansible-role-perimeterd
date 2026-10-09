@@ -49,6 +49,7 @@ jobs:
           ln -s "${GITHUB_WORKSPACE}" "${RUNNER_TEMP}/roles/perimeterd"
           echo "ANSIBLE_ROLES_PATH=${RUNNER_TEMP}/roles" >> "${GITHUB_ENV}"
           ANSIBLE_ROLES_PATH="${RUNNER_TEMP}/roles" ansible-playbook -i 'perimeterd,' -c local tests/vm/smoke.yml --syntax-check
+          ANSIBLE_ROLES_PATH="${RUNNER_TEMP}/roles" ansible-playbook -i localhost, tests/vm/resolve-release.yml --syntax-check
       - name: Lint role tasks and workflow-facing playbooks
         if: matrix.ansible_core == '2.21'
         run: |
@@ -69,11 +70,6 @@ jobs:
             python: '3.13'
             collection_requirements: requirements-collections.yml
             require_kvm: true
-          - platform: fedora-arm64
-            ansible_core: '2.21'
-            python: '3.14'
-            collection_requirements: requirements-collections.yml
-            require_kvm: false
           - platform: rocky-amd64
             ansible_core: '2.16'
             python: '3.12'
@@ -131,4 +127,106 @@ jobs:
             ${{ runner.temp }}/perimeterd-role-vm/logs/
             ${{ runner.temp }}/perimeterd-role-vm/current-format/logs/
             ${{ runner.temp }}/perimeterd-role-vm/fresh-stale-inode/logs/
+          if-no-files-found: warn
+
+  fedora-release:
+    name: Fedora ARM64 release selection
+    if: github.event_name == 'push'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+    steps:
+      - name: Check out role
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Ansible controller
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.14'
+      - name: Install latest patch of selected controller line
+        run: python -m pip install 'ansible-core==2.21.*'
+      - name: Resolve published Fedora ARM64 release
+        env:
+          PERIMETERD_TEST_GITHUB_TOKEN: ${{ github.token }}
+          VM_RELEASE_OUTPUT: ${{ runner.temp }}/perimeterd-fedora-release.json
+        run: |
+          mkdir -p "${RUNNER_TEMP}/roles"
+          ln -s "${GITHUB_WORKSPACE}" "${RUNNER_TEMP}/roles/perimeterd"
+          ANSIBLE_ROLES_PATH="${RUNNER_TEMP}/roles" ansible-playbook -i localhost, \
+            tests/vm/resolve-release.yml --extra-vars "vm_release_output=${VM_RELEASE_OUTPUT}"
+      - name: Export selected release tag
+        id: release
+        env:
+          VM_RELEASE_OUTPUT: ${{ runner.temp }}/perimeterd-fedora-release.json
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          selected = json.loads(Path(os.environ["VM_RELEASE_OUTPUT"]).read_text())
+          tag = selected["tag"]
+          if (
+              not isinstance(tag, str)
+              or not tag
+              or any(character.isspace() for character in tag)
+              or tag in {"latest", "latest-prerelease"}
+          ):
+              raise SystemExit("Resolver output must contain a nonempty exact single-line tag")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"tag={tag}\n")
+          PY
+
+  vm-fedora:
+    name: native systemd VM (fedora-arm64, ${{ matrix.scenario }}, core 2.21)
+    needs: fedora-release
+    if: github.event_name == 'push'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario: [current-format, fresh-stale-inode]
+    steps:
+      - name: Check out role
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Ansible controller
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.14'
+      - name: Install QEMU and cloud-init seed tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes qemu-system-x86 qemu-system-arm qemu-efi-aarch64 qemu-utils genisoimage openssh-client
+      - name: Install the matching controller and collection requirements
+        run: |
+          python -m pip install 'ansible-core==2.21.*'
+          ansible-galaxy collection install -r requirements-collections.yml
+      - name: Exercise selected scenario in isolated VM
+        env:
+          PERIMETERD_TEST_GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.fedora-release.outputs.tag }}
+          SCENARIO: ${{ matrix.scenario }}
+        run: |
+          test -n "$RELEASE_TAG" || {
+            echo 'Fedora prerequisite did not provide an exact release tag' >&2
+            exit 1
+          }
+          args=(--platform fedora-arm64
+                --scenario "$SCENARIO"
+                --release-tag "$RELEASE_TAG"
+                --workdir "$RUNNER_TEMP/perimeterd-role-vm")
+          python tests/vm/run.py "${args[@]}"
+      - name: Upload VM diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: role-vm-fedora-arm64-${{ matrix.scenario }}
+          path: |
+            ${{ runner.temp }}/perimeterd-role-vm/logs/
+            ${{ runner.temp }}/perimeterd-role-vm/${{ matrix.scenario }}/logs/
           if-no-files-found: warn
