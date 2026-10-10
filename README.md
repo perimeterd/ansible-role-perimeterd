@@ -7,7 +7,7 @@ Deploy and manage [perimeterd](https://github.com/perimeterd/perimeterd) with An
 - **Converge without unnecessary restarts.** Manage boot enablement and running state independently, including stopped installations.
 - **Use native packages.** Install checksum-verified DEB/RPM assets with APT, DNF4, DNF5, or Zypper on amd64 and arm64 hosts.
 
-Published in the [perimeterd Ansible Galaxy namespace](https://galaxy.ansible.com/ui/standalone/namespaces/29189/). Role releases and daemon releases have independent version numbers.
+The role's Galaxy name is `perimeterd.perimeterd`, in the [perimeterd namespace](https://galaxy.ansible.com/ui/standalone/namespaces/29189/). Role releases and daemon releases have independent version numbers.
 
 ## Requirements
 
@@ -38,7 +38,7 @@ ansible-galaxy role install -r requirements.yml
 ansible-galaxy collection install -r requirements.yml
 ```
 
-For reproducible deployments, add `version` to the role entry using a published **role** tag. For example, `version: '1.0.0'` is role-pin syntax, not a claim that this role tag exists or a pin of the daemon. For legacy core 2.16, use the collection range `'>=11.4.9,<12.0.0'` in a separate collection path or execution environment.
+The role version is intentionally unpinned, so a fresh install selects the latest imported role release. For reproducible deployments, add a `version` field with a published role tag. This does not pin the daemon. For legacy core 2.16, use the collection range `'>=11.4.9,<12.0.0'` in a separate collection path or execution environment.
 
 ## Quick start
 
