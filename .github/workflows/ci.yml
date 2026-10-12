@@ -53,7 +53,7 @@ jobs:
       - name: Lint role tasks and workflow-facing playbooks
         if: matrix.ansible_core == '2.21'
         run: |
-          python -m pip install ansible-lint==26.9.0
+          python -m pip install ansible-lint==26.10.0
           ansible-lint --strict .
 
   vm:
