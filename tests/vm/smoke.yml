@@ -89,6 +89,9 @@
         _smoke_expected_marker: |
           config_sha256={{ _smoke_config_bytes.content | b64decode | hash('sha256') }}
           package={{ _perimeterd_package_identity }}
+          {% if perimeterd_crowdsec_api_key is defined and smoke_config.crowdsec.enabled | default(false) %}
+          crowdsec_api_key_sha256={{ perimeterd_crowdsec_api_key | hash('sha256') }}
+          {% endif %}
       ansible.builtin.assert:
         that:
           - (_smoke_applied.content | b64decode) == _smoke_expected_marker

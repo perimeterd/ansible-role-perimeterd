@@ -4,13 +4,14 @@ The role installs official perimeterd native packages, owns the complete daemon 
 
 ## Public variables
 
-These are the eight supported inputs. Internal `_perimeterd_*` facts are implementation details.
+These are the supported inputs. Internal `_perimeterd_*` facts are implementation details.
 
 | Variable | Default | Contract |
 | --- | --- | --- |
 | `perimeterd_version` | `latest` | `latest`, `latest-prerelease`, or an exact published SemVer tag, optionally containing its actual `v` prefix. |
 | `perimeterd_allow_downgrade` | `false` | Boolean permitting native package downgrade handling; not permission to discard or convert daemon state. |
 | `perimeterd_config` | See below | Complete, nonempty daemon configuration mapping with a `firewall` mapping. It replaces the configuration; it does not merge old or default keys. An explicit backend must be `nftables` or `iptables`. |
+| `perimeterd_crowdsec_api_key` | Undefined | Optional registered CrowdSec bouncer key string. When defined and `crowdsec.enabled` is true, manage the configured `crowdsec.api_key_file` and reload a running service on key changes. |
 | `perimeterd_service_enabled` | `true` | Boolean controlling systemd boot enablement independently of running state. |
 | `perimeterd_service_state` | `started` | `started` or `stopped`. A deliberately stopped service stays stopped across package and configuration changes. |
 | `perimeterd_config_show_diff` | `false` | Boolean enabling output of the new configuration after successful validation and a content change. The old configuration is redacted; the new configuration is **not** secret-redacted. |
@@ -45,7 +46,7 @@ Install `community.general` from [requirements-collections.yml](../requirements-
 
 **Managed host:** Linux, x86_64/amd64 or aarch64/arm64, APT, DNF4, DNF5 or Zypper, a working systemd manager, and target Python supported by the selected ansible-core. Supply root escalation in the play. Provide trusted CA roots and outbound HTTPS to `github.com`, official release-asset redirect hosts and required native repositories. The role does not bootstrap CA roots. Support is capability-based, not an OS-name/version allowlist; Galaxy platform metadata is not a promise that every historical release works. [Development](development.md) owns the CI matrix.
 
-Configuration-only reload requires the acknowledged `perimeterd reload --expect-config-sha256` command and the running daemon's private reload endpoint. A CLI or running daemon without that capability fails rather than falling back to signal delivery.
+Configuration-only and managed-key-only reloads require the acknowledged `perimeterd reload --expect-config-sha256` command and the running daemon's private reload endpoint. A CLI or running daemon without that capability fails rather than falling back to signal delivery.
 
 ### Dependencies and firewall backend
 
@@ -57,9 +58,32 @@ The role does not choose or install firewall tools from `perimeterd_config`; cha
 
 The role manages `/etc/perimeterd/perimeterd.yaml` as root-owned `0600` in a root-owned `0700` directory. It validates a candidate with the installed `/usr/bin/perimeterd` before atomic replacement, and also validates unchanged configuration with that executable. Keep the complete mapping in Vault-protected inventory when it contains secrets. Candidate values, validator output and normal Ansible diffs are suppressed. `perimeterd_config_show_diff: true` prints the new mapping without secret redaction; do not enable it for sensitive configuration.
 
-Credential files, CrowdSec/OpenZiti enrollment and other secret-file provisioning belong to the caller. Deploy them before referencing their paths. Offline validation does not read credentials, authenticate, resolve feeds or test external systems. The optional GitHub token belongs on the controller, preferably in Vault or an environment lookup; API requests and token-bearing facts use `no_log`.
+The role optionally provisions a registered CrowdSec bouncer key as described below. CrowdSec bouncer registration, OpenZiti enrollment and all other secret-file provisioning belong to the caller. Deploy caller-managed files before referencing their paths. Offline validation does not read credentials, authenticate, resolve feeds or test external systems. The optional GitHub token belongs on the controller, preferably in Vault or an environment lookup; API requests and token-bearing facts use `no_log`.
 
 The native package owns the executable and systemd unit; the role supplies no replacement unit. The role retains verified artifacts in private `/var/cache/perimeterd` and its own application marker under `/var/lib/perimeterd-ansible`. Daemon runtime state under `/var/lib/perimeterd` remains daemon-owned. The role does not uninstall perimeterd, wipe firewall rules or runtime state, or clean arbitrary caches. Stopping the daemon does not remove its committed static firewall policy.
+
+### CrowdSec bouncer key
+
+Store the already registered key in Vault-protected inventory and supply it separately from the complete daemon configuration:
+
+```yaml
+perimeterd_crowdsec_api_key: "{{ vault_perimeterd_crowdsec_api_key }}"
+perimeterd_config:
+  version: 1
+  firewall:
+    backend: nftables
+  policies: []
+  crowdsec:
+    enabled: true
+    lapi_url: http://127.0.0.1:8080
+    api_key_file: /etc/perimeterd/credentials.d/crowdsec_api_key
+```
+
+Retain your full intended configuration and policies when adding this block. When managing the key, `crowdsec.api_key_file` must be an absolute path; the role rejects relative paths before creating the credential directory or changing its ownership or permissions. The role writes the key bytes without adding a newline, atomically, after configuration validation and before service reconciliation. It enforces root ownership, `0700` on the destination's parent directory and `0600` on the file. Use a dedicated private directory, not a shared directory whose ownership or access modes must remain unchanged. The key copy and digest facts use `no_log`; key-file and checkpoint diffs are always suppressed, independently of `perimeterd_config_show_diff`.
+
+Both a defined `perimeterd_crowdsec_api_key` and enabled CrowdSec are required. There is deliberately no default key and no separate enable switch. Leaving the variable undefined preserves caller-managed credentials; disabling CrowdSec or removing the variable does not delete a previously provisioned file. Changing `api_key_file` also leaves the old file in place; retire obsolete secrets explicitly.
+
+A managed key change requests the same acknowledged reload as a configuration change, without restarting a current running executable. Package changes still take restart precedence. The private application marker tracks the key digest only after successful service handling, so a rejected or interrupted reload is retried even if the next key copy is unchanged. A desired-stopped service stays stopped while the file is provisioned or rotated. No downstream refresh handler is needed.
 
 ## Integrity and package transactions
 
@@ -73,13 +97,13 @@ Native managers determine equality, version ordering and installability; the rol
 
 ## Check mode
 
-Check mode gathers facts, validates inputs, resolves release metadata on the controller and fetches/parses the checksum manifest on the target. It still needs network access, target Python and privileges required by the play. It does **not** download or install the package, inspect native downgrade compatibility, validate/render daemon configuration, change enablement, or start/stop/restart/reload the service. It predicts no installation or lifecycle changes. A successful check run is not evidence that a normal deployment succeeds.
+Check mode gathers facts, validates inputs, resolves release metadata on the controller and fetches/parses the checksum manifest on the target. It still needs network access, target Python and privileges required by the play. It does **not** download or install the package, inspect native downgrade compatibility, validate/render daemon configuration, provision credentials, change enablement, or start/stop/restart/reload the service. It predicts no installation or lifecycle changes. A successful check run is not evidence that a normal deployment succeeds.
 
 ## Failure, recovery and downgrade compatibility
 
 Installation is not one atomic transaction. A rejected downgrade can leave a downloaded artifact; APT can also install `xz-utils` and update its package cache before rejecting the daemon package. A later configuration or service failure can leave the selected package installed. Invalid configuration is not atomically installed, and configuration failure prevents service reconciliation; existing configuration and a running old executable can remain.
 
-After correcting the cause, rerun the role. A stale running executable is detected even if the new run's package transaction reports no change. Failed service handling leaves the application marker unadvanced, so unapplied configuration is retried. See [service reconciliation](architecture.md#service-reconciliation) for exact precedence and marker limits.
+After correcting the cause, rerun the role. A stale running executable is detected even if the new run's package transaction reports no change. Failed service handling leaves the application marker unadvanced, so unapplied configuration and managed key changes are retried. A rejected key reload leaves the new credential file on disk; it does not restore the previous file. See [service reconciliation](architecture.md#service-reconciliation) for exact precedence and marker limits.
 
 A reload rejected before application retains the previous policy. Degraded or unknown completion is not proof of rollback: preserve durable evidence and inspect the reported error and service journal. Maintain console recovery access when changing live firewall policy.
 

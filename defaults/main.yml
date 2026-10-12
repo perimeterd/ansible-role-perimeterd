@@ -6,6 +6,8 @@ perimeterd_config:
   firewall:
     backend: nftables
   policies: []
+# perimeterd_crowdsec_api_key is intentionally undefined; set it to manage
+# perimeterd_config.crowdsec.api_key_file when CrowdSec is enabled.
 perimeterd_service_enabled: true
 perimeterd_service_state: started
 perimeterd_config_show_diff: false

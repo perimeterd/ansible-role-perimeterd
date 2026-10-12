@@ -1,16 +1,16 @@
 """Reject malicious release manifests before any managed-host package mutation."""
 
-from http.server import ThreadingHTTPServer
 import json
 import os
-from pathlib import Path
 import ssl
 import subprocess
 import tempfile
 import threading
 import unittest
+from http.server import ThreadingHTTPServer
+from pathlib import Path
 
-from resolver.test_selection import FixtureProxy, ROLE, release
+from resolver.test_selection import ROLE, FixtureProxy, release
 
 TAG = "0.0.1-dev.7.g607202599b29"
 PATH = f"/perimeterd/perimeterd/releases/download/{TAG}/checksums.txt"
@@ -75,6 +75,7 @@ class ChecksumManifestWithAnsible(unittest.TestCase):
                    ANSIBLE_NOCOLOR="1")
         result = subprocess.run(
             ["ansible-playbook", "-i", "fixture,", str(self.playbook), "--check"],
+            check=False,
             cwd=ROLE, env=env, text=True, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, timeout=120)
         self.assertNotEqual(result.returncode, 0, result.stdout)

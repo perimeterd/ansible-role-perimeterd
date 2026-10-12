@@ -69,7 +69,7 @@ ansible-playbook -i inventory.ini perimeterd.yml
 
 **This starts the firewall manager, even with an empty policy list. It is not a dry run.** The role owns the entire `/etc/perimeterd/perimeterd.yaml`; it does not merge your mapping with existing configuration. On existing installations, supply your complete intended configuration rather than replacing it with this baseline. Prepare console recovery and roll out serially before applying live firewall changes.
 
-Credential files and external integrations remain yours to provision.
+The role can [provision a registered CrowdSec bouncer key](docs/reference.md#crowdsec-bouncer-key) when `perimeterd_crowdsec_api_key` is defined. Enrollment, other credential files and external integrations remain yours to provision.
 
 ## Common choices
 

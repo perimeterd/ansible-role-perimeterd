@@ -1,12 +1,12 @@
 """Behavioral boundaries for owned acceleration, readiness and partial timings."""
-from contextlib import ExitStack
 import json
-from pathlib import Path
 import subprocess
 import sys
 import tempfile
-from types import SimpleNamespace
 import unittest
+from contextlib import ExitStack
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from vm import run as harness
@@ -131,7 +131,7 @@ class ScenarioTests(unittest.TestCase):
                 result = subprocess.run(
                     [sys.executable, str(harness.ROLE / "tests/vm/run.py"), "--platform", "debian-amd64",
                      "--workdir", str(work), "--identity", "/missing/key", *arguments],
-                    text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
+                    check=False, text=True, capture_output=True, timeout=10)
                 self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
                 self.assertFalse(work.exists())
 
@@ -188,7 +188,7 @@ class AcceleratorTests(unittest.TestCase):
                 [sys.executable, str(harness.ROLE / "tests/vm/run.py"), "--platform", "debian-amd64",
                  "--external-port", "1", "--identity", str(Path(work) / "missing-key"),
                  "--require-kvm", "--workdir", str(untouched)],
-                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
+                check=False, text=True, capture_output=True, timeout=10)
             self.assertEqual(completed.returncode, 2)
             self.assertIn("--require-kvm", completed.stderr)
             self.assertIn("--external-port", completed.stderr)
@@ -256,9 +256,9 @@ class GuestBoundaryTests(unittest.TestCase):
 
     def test_timeout_retains_output_and_original_exception(self):
         error = subprocess.TimeoutExpired("ansible-playbook", 1000, output=b"partial\xff output")
-        with patch.object(harness.subprocess, "run", side_effect=error):
-            with self.assertRaises(subprocess.TimeoutExpired) as failure:
-                self.guest.play("timeout")
+        with patch.object(harness.subprocess, "run", side_effect=error), \
+                self.assertRaises(subprocess.TimeoutExpired) as failure:
+            self.guest.play("timeout")
         self.assertIs(failure.exception, error)
         self.assertEqual(self.records()[-1]["outcome"], "timeout")
         self.assertEqual((self.logs / "timeout.log").read_text(), "partial\ufffd output")
@@ -266,24 +266,24 @@ class GuestBoundaryTests(unittest.TestCase):
     def test_nested_failure_totals_include_cleanup_and_preserve_exception(self):
         now = [0.0]
         error = RuntimeError("lifecycle failed")
-        with patch.object(harness.time, "monotonic", side_effect=lambda: now[0]):
-            with self.assertRaises(RuntimeError) as failure:
-                with self.timings.measure("scenario", "current-format", scenario="current-format"):
-                    try:
-                        with self.timings.measure("phase", "lifecycle", scenario="current-format"):
-                            now[0] = 4.0
-                            raise error
-                    finally:
-                        with self.timings.measure("phase", "cleanup", scenario="current-format"):
-                            now[0] = 7.0
+        with patch.object(harness.time, "monotonic", side_effect=lambda: now[0]), \
+                self.assertRaises(RuntimeError) as failure, \
+                self.timings.measure("scenario", "current-format", scenario="current-format"):
+            try:
+                with self.timings.measure("phase", "lifecycle", scenario="current-format"):
+                    now[0] = 4.0
+                    raise error
+            finally:
+                with self.timings.measure("phase", "cleanup", scenario="current-format"):
+                    now[0] = 7.0
         self.assertIs(failure.exception, error)
         self.assertEqual([(record["label"], record["elapsed_seconds"], record["outcome"]) for record in self.records()],
                          [("lifecycle", 4.0, "failed"), ("cleanup", 3.0, "passed"), ("current-format", 7.0, "failed")])
 
     def test_reporting_failure_does_not_replace_original_failure(self):
         error = KeyboardInterrupt()
-        with patch.object(Path, "open", side_effect=OSError("disk full")):
-            with self.assertRaises(KeyboardInterrupt) as failure:
-                with self.timings.measure("phase", "lifecycle"):
-                    raise error
+        with patch.object(Path, "open", side_effect=OSError("disk full")), \
+                self.assertRaises(KeyboardInterrupt) as failure, \
+                self.timings.measure("phase", "lifecycle"):
+            raise error
         self.assertIs(failure.exception, error)

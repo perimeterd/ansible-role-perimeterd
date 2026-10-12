@@ -2,14 +2,15 @@
 import hashlib
 import http.client
 import json
-from pathlib import Path
 import shutil
 import ssl
 import subprocess
 import tempfile
 import unittest
+from pathlib import Path
 
 from vm.candidate import API, Candidate, PackageFixture, asset_name
+
 from .test_vm_harness import owned_run
 
 VERSION = "0.0.1-dev.8.g123456789abc"

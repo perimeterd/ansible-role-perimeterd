@@ -65,6 +65,10 @@
   ansible.builtin.import_tasks: config.yml
   when: not ansible_check_mode
 
+- name: Provision optional perimeterd integration credentials
+  ansible.builtin.import_tasks: credentials.yml
+  when: not ansible_check_mode
+
 - name: Apply the desired perimeterd service state
   ansible.builtin.import_tasks: service.yml
   when: not ansible_check_mode

@@ -1,10 +1,9 @@
-from pathlib import Path
 import unittest
+from pathlib import Path
 
+import yaml
 from ansible.plugins.filter.core import to_nice_yaml
 from jinja2 import Environment, StrictUndefined
-import yaml
-
 
 ROLE_ROOT = Path(__file__).resolve().parents[2]
 TEMPLATE_PATH = ROLE_ROOT / "templates" / "perimeterd.yaml.j2"

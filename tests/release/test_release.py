@@ -3,14 +3,14 @@ import copy
 import http.server
 import json
 import os
-from pathlib import Path
 import shutil
 import subprocess
 import tempfile
 import threading
 import unittest
-from unittest import mock
 import urllib.error
+from pathlib import Path
+from unittest import mock
 
 from scripts import release
 

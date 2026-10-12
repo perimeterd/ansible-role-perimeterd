@@ -1,10 +1,9 @@
 import base64
-from pathlib import Path
 import unittest
+from pathlib import Path
 
-from jinja2 import Environment, StrictUndefined
 import yaml
-
+from jinja2 import Environment, StrictUndefined
 
 TASKS = yaml.safe_load((Path(__file__).resolve().parents[2] / 'tasks/service.yml').read_text())
 RECONCILE = next(task for task in TASKS if 'block' in task)
@@ -13,7 +12,7 @@ SELECT = next(task for task in RECONCILE['block'] if 'ansible.builtin.set_fact' 
 
 class ServiceActionTests(unittest.TestCase):
     def setUp(self):
-        self.environment = Environment(undefined=StrictUndefined)
+        self.environment = Environment(undefined=StrictUndefined, trim_blocks=True)
         self.environment.filters['b64decode'] = lambda value: base64.b64decode(value).decode()
         self.values = {
             'perimeterd_service_state': 'started',
@@ -56,6 +55,30 @@ class ServiceActionTests(unittest.TestCase):
         self.assertEqual(self.action(), 'started')
         self.assertEqual(self.action(_perimeterd_applied_marker={}), 'reload')
         self.assertEqual(self.action(_perimeterd_applied_marker={'content': 'b2xk'}), 'reload')
+
+    def test_managed_key_rotation_reloads_until_success_is_checkpointed(self):
+        marker = RECONCILE['vars']['_perimeterd_expected_marker']
+        inputs = {'_perimeterd_config_sha256': 'abc', '_perimeterd_package_identity': 'xyz'}
+        previous = self.environment.from_string(marker).render(
+            **inputs, _perimeterd_crowdsec_credential_sha256='1' * 64)
+        rotated = self.environment.from_string(marker).render(
+            **inputs, _perimeterd_crowdsec_credential_sha256='2' * 64)
+        applied = {'content': base64.b64encode(previous.encode()).decode()}
+        # A failed reload leaves the previous marker, including on a rerun whose
+        # credential copy reports unchanged content.
+        self.assertEqual(self.action(_perimeterd_expected_marker=rotated,
+                                     _perimeterd_applied_marker=applied), 'reload')
+        applied = {'content': base64.b64encode(rotated.encode()).decode()}
+        self.assertEqual(self.action(_perimeterd_expected_marker=rotated,
+                                     _perimeterd_applied_marker=applied), 'started')
+
+    def test_unmanaged_credentials_preserve_configuration_only_checkpoint(self):
+        marker = RECONCILE['vars']['_perimeterd_expected_marker']
+        inputs = {'_perimeterd_config_sha256': 'abc', '_perimeterd_package_identity': 'xyz'}
+        for values in ({}, {'_perimeterd_crowdsec_credential_sha256': ''}):
+            with self.subTest(values=values):
+                expected = self.environment.from_string(marker).render(**inputs, **values)
+                self.assertEqual(self.action(_perimeterd_expected_marker=expected), 'started')
 
     def test_stopped_does_not_enter_reconciliation(self):
         self.assertFalse(self.enabled(RECONCILE, perimeterd_service_state='stopped'))

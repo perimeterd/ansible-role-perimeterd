@@ -14,6 +14,10 @@ argument_specs:
       perimeterd_config:
         type: dict
         description: Complete daemon configuration mapping; no implicit merge.
+      perimeterd_crowdsec_api_key:
+        type: str
+        no_log: true
+        description: Optional registered bouncer key; provision the absolute crowdsec.api_key_file path when CrowdSec is enabled.
       perimeterd_service_enabled:
         type: bool
         default: true

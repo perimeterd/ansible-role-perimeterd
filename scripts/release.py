@@ -44,6 +44,7 @@ def admit(ref, sha, public_keys):
         subprocess.run(["gpg", "--batch", "--import"], input=public_keys, text=True, env=env, check=True)
         verification = subprocess.run(
             ["git", "-c", "gpg.format=openpgp", "-c", "gpg.program=gpg", "verify-tag", "--raw", f"refs/tags/{tag}"],
+            check=False,
             env=env, text=True, capture_output=True,
         )
         sys.stderr.write(verification.stderr)
@@ -114,8 +115,7 @@ def main():
                      os.environ.get("RELEASE_SIGNING_PUBLIC_KEYS", ""))
     if args.action == "admit":
         with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
-            for key, value in metadata.items():
-                output.write(f"{key}={value}\n")
+            output.writelines(f"{key}={value}\n" for key, value in metadata.items())
         print(json.dumps(metadata))
     else:
         if metadata != {"tag": os.environ["ROLE_TAG"], "commit": os.environ["COMMIT"]}:

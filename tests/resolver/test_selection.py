@@ -4,15 +4,15 @@ The proxy preserves the role's fixed https://api.github.com URLs: test code
 intercepts the controller connection, not a production-configurable API origin.
 """
 
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
-from pathlib import Path
 import ssl
 import subprocess
 import tempfile
 import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from unittest.mock import patch
 
 from vm import run as harness
@@ -154,6 +154,7 @@ class ResolverWithAnsible(unittest.TestCase):
         result = subprocess.run(
             ["ansible-playbook", "-i", "fixture,", str(self.playbook), "-e",
              json.dumps({"perimeterd_version": selector})],
+            check=False,
             cwd=ROLE, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, timeout=120)
         self.assertNotIn(SECRET, result.stdout)
@@ -178,6 +179,7 @@ class ResolverWithAnsible(unittest.TestCase):
         result = subprocess.run(
             ["ansible-playbook", "-i", "localhost,", str(ROLE / "tests/vm/resolve-release.yml"),
              "-e", json.dumps(variables)],
+            check=False,
             cwd=ROLE, env=dict(self.fixture_environment(), ANSIBLE_ROLES_PATH=str(roles)),
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120)
         self.assertNotIn(SECRET, result.stdout)
@@ -400,6 +402,7 @@ class ResolverWithAnsible(unittest.TestCase):
                    NO_PROXY="", no_proxy="", SSL_CERT_FILE=str(self.cert),
                    ANSIBLE_NOCOLOR="1")
         result = subprocess.run(["ansible-playbook", "-i", "fixture,", str(playbook)],
+                                check=False,
                                 cwd=ROLE, env=env, text=True, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, timeout=120)
         self.assertEqual(result.returncode, 0, result.stdout)
@@ -451,6 +454,7 @@ class ResolverWithAnsible(unittest.TestCase):
                    NO_PROXY="", no_proxy="", SSL_CERT_FILE=str(self.cert),
                    ANSIBLE_NOCOLOR="1")
         result = subprocess.run(["ansible-playbook", "-i", "fixture,", str(playbook)],
+                                check=False,
                                 cwd=ROLE, env=env, text=True, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, timeout=120)
         self.assertEqual(result.returncode, 0, result.stdout)
@@ -485,6 +489,7 @@ class ResolverWithAnsible(unittest.TestCase):
                    ANSIBLE_NOCOLOR="1")
         result = subprocess.run(
             ["ansible-playbook", "-i", "fixture_a,fixture_b,", str(playbook)],
+            check=False,
             cwd=ROLE, env=env, text=True, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, timeout=120)
         self.assertEqual(result.returncode, 0, result.stdout)

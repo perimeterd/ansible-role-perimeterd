@@ -2,12 +2,9 @@
 """Run the real upstream package and systemd smoke matrix in disposable VMs."""
 
 import argparse
-from contextlib import ExitStack, contextmanager
-from dataclasses import dataclass
 import hashlib
 import json
 import os
-from pathlib import Path
 import re
 import shlex
 import shutil
@@ -16,7 +13,11 @@ import subprocess
 import sys
 import tempfile
 import time
+from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass
+from pathlib import Path
 from urllib.request import urlopen
+
 if __package__:
     from .candidate import Candidate, PackageFixture
 else:
@@ -312,6 +313,7 @@ class Guest:
                        **self.controller_environment)
             try:
                 completed = subprocess.run(argv, text=True, stdin=subprocess.DEVNULL,
+                                           check=False,
                                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env, timeout=1000)
             except subprocess.TimeoutExpired as error:
                 output = error.stdout or ""

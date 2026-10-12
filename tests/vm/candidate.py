@@ -1,14 +1,14 @@
 """Test-only verified GoReleaser handoff at the role's official HTTPS URLs."""
-from contextlib import ExitStack
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import hashlib
 import json
-from pathlib import Path
 import re
 import ssl
 import subprocess
 import tempfile
 import threading
+from contextlib import ExitStack
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import quote
 
 API = "/repos/perimeterd/perimeterd/releases"
@@ -41,7 +41,7 @@ def verified_package(package, manifest, version, platform):
     else:
         argv = ["rpm", "-qp", "--qf", "%{NAME}\t%{EPOCHNUM}:%{VERSION}-%{RELEASE}\t%{ARCH}", str(package)]
         expected = f"perimeterd\t0:{native_version}\t" + ("aarch64" if platform.endswith("arm64") else "x86_64")
-    actual = subprocess.run(argv, check=True, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout
+    actual = subprocess.run(argv, check=True, text=True, capture_output=True).stdout
     if actual != expected:
         raise ValueError(f"native package identity mismatch: expected {expected!r}, got {actual!r}")
     return data
@@ -89,9 +89,8 @@ class RestrictedProxy(BaseHTTPRequestHandler):
     def do_GET(self):
         host = getattr(self, "fixture_host", None)
         body = self.server.routes.get((host, self.path))
-        with self.server.log_lock:
-            with self.server.log.open("a") as output:
-                output.write(f"{host} {self.path} {200 if body is not None else 404}\n")
+        with self.server.log_lock, self.server.log.open("a") as output:
+            output.write(f"{host} {self.path} {200 if body is not None else 404}\n")
         if self.headers.get("Host") not in (host, f"{host}:443") or body is None:
             self.send_error(404, "fixture host/route not configured")
             return

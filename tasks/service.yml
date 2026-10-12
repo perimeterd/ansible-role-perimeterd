@@ -19,6 +19,9 @@
     _perimeterd_expected_marker: |
       config_sha256={{ _perimeterd_config_sha256 }}
       package={{ _perimeterd_package_identity }}
+      {% if _perimeterd_crowdsec_credential_sha256 | default('') %}
+      crowdsec_api_key_sha256={{ _perimeterd_crowdsec_credential_sha256 }}
+      {% endif %}
   block:
     # Compare actual executables to recover an upgrade interrupted after package
     # installation, when this run's package task correctly reports no change.
@@ -104,4 +107,6 @@
         owner: root
         group: root
         mode: '0600'
+      no_log: true
+      diff: false
       when: not ansible_check_mode
