@@ -597,13 +597,13 @@ class PrivateSocketFailure:
 
     def __enter__(self):
         guest = self.guest
-        guest.ssh("sudo mv /run/perimeterd/lookup.sock /run/perimeterd/lookup.sock.saved")
+        guest.ssh("sudo mv /run/perimeterd/control.sock /run/perimeterd/control.sock.saved")
         if self.mode == "unavailable":
             return self
         code = """import os, socket, time
 s = socket.socket(socket.AF_UNIX)
-s.bind('/run/perimeterd/lookup.sock')
-os.chmod('/run/perimeterd/lookup.sock', 0o600)
+s.bind('/run/perimeterd/control.sock')
+os.chmod('/run/perimeterd/control.sock', 0o600)
 s.listen(2)
 open('/run/perimeterd/socket-fault-ready','w').close()
 c, _ = s.accept()
@@ -626,8 +626,8 @@ c.recv(4096)
     def __exit__(self, *_):
         self.guest.ssh("sudo systemctl stop role-socket-fault.service 2>/dev/null || true; "
                        "sudo systemctl reset-failed role-socket-fault.service 2>/dev/null || true; "
-                       "sudo rm -f /run/perimeterd/lookup.sock /run/perimeterd/socket-fault-ready; "
-                       "sudo mv /run/perimeterd/lookup.sock.saved /run/perimeterd/lookup.sock")
+                       "sudo rm -f /run/perimeterd/control.sock /run/perimeterd/socket-fault-ready; "
+                       "sudo mv /run/perimeterd/control.sock.saved /run/perimeterd/control.sock")
 
 
 def guest_python(guest, code):

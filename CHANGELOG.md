@@ -4,6 +4,9 @@ Role release tags are independent of perimeterd daemon release tags. This change
 
 ## Unreleased
 
+- Update VM reload fault injection and architecture documentation for the daemon's shared `/run/perimeterd/control.sock`.
+- Include the issuing CA's key identifier in candidate TLS fixture certificates so strict Python certificate validation succeeds without relaxing verification.
+
 ## 0.0.2
 
 - Add opt-in CrowdSec bouncer key provisioning through `perimeterd_crowdsec_api_key`, with private root-owned directory/file permissions and suppressed secret output.

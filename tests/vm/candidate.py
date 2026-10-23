@@ -110,7 +110,7 @@ class PackageFixture:
             ca_key, self.cert = self.work / "ca.key", self.work / "ca.crt"
             key, cert, csr = self.work / "server.key", self.work / "server.crt", self.work / "server.csr"
             extensions = self.work / "extensions"
-            extensions.write_text("subjectAltName=DNS:api.github.com,DNS:github.com\nbasicConstraints=CA:FALSE\nextendedKeyUsage=serverAuth\n")
+            extensions.write_text("subjectAltName=DNS:api.github.com,DNS:github.com\nbasicConstraints=CA:FALSE\nextendedKeyUsage=serverAuth\nauthorityKeyIdentifier=keyid,issuer\n")
             commands = [
                 ["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1", "-subj", "/CN=perimeterd disposable test CA", "-addext", "basicConstraints=critical,CA:TRUE", "-addext", "keyUsage=critical,keyCertSign,cRLSign", "-keyout", str(ca_key), "-out", str(self.cert)],
                 ["req", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=api.github.com", "-keyout", str(key), "-out", str(csr)],

@@ -50,7 +50,7 @@ The role runs:
 /usr/bin/perimeterd reload --expect-config-sha256 <rendered-config-digest>
 ```
 
-The digest covers the UTF-8 bytes produced by [`perimeterd.yaml.j2`](../templates/perimeterd.yaml.j2), including the managed-file header and final newline; it is not a hash of a separately reconstructed mapping. The CLI sends the expected digest to the running daemon's private `/v1/reload` endpoint through `/run/perimeterd/lookup.sock`.
+The digest covers the UTF-8 bytes produced by [`perimeterd.yaml.j2`](../templates/perimeterd.yaml.j2), including the managed-file header and final newline; it is not a hash of a separately reconstructed mapping. The CLI sends the expected digest to the running daemon's private `/v1/reload` endpoint through `/run/perimeterd/control.sock`.
 
 The daemon reads the configuration once, hashes those same bytes and rejects a mismatch before loading credentials, resolving sources or applying native policy. A successful command acknowledges that request's committed revision, completed required native work and runtime publication, healthy enforcement, and no pending recovery. It is not merely signal delivery, process liveness or a later health sample. A later reload or refresh can supersede the acknowledged revision.
 
